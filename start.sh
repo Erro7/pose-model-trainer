@@ -50,12 +50,46 @@ unset GRADIO_ROOT_PATH
 log_info "PyPI source: ${PIP_INDEX_URL}"
 
 RECOMMENDED_IMAGE="modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04"
-if [[ -z "${TRAINER_RUNTIME_PROFILE:-}" ]]; then
-  if ! command -v nvidia-smi >/dev/null 2>&1; then
-    log_error "preflight: NVIDIA GPU is not visible"
+
+SYSTEM_TORCH_INFO="$(python3 -c 'import torch; print(f"{torch.__version__}|{torch.version.cuda or ""}|{getattr(torch.version, "hip", "") or ""}")' 2>/dev/null || true)"
+if [[ -n "${SYSTEM_TORCH_INFO}" ]]; then
+  IFS='|' read -r SYSTEM_TORCH SYSTEM_CUDA SYSTEM_HIP <<< "${SYSTEM_TORCH_INFO}"
+else
+  SYSTEM_TORCH="not installed"
+  SYSTEM_CUDA=""
+  SYSTEM_HIP=""
+fi
+
+ROCM_INFO=""
+ROCM_IMAGE=0
+if [[ -n "${SYSTEM_HIP}" ]]; then
+  ROCM_INFO="torch HIP ${SYSTEM_HIP}"
+elif command -v rocm-smi >/dev/null 2>&1 || [[ -d /opt/rocm ]] || [[ -n "${ROCM_PATH:-}" || -n "${HIP_PATH:-}" ]]; then
+  ROCM_ROOT="${ROCM_PATH:-${HIP_PATH:-/opt/rocm}}"
+  ROCM_VERSION="$(cat "${ROCM_ROOT}/.info/version" 2>/dev/null || true)"
+  ROCM_INFO="${ROCM_VERSION:-ROCm installation detected}"
+fi
+if [[ -n "${TRAINER_BASE_IMAGE:-}" && "${TRAINER_BASE_IMAGE,,}" == *rocm* ]]; then
+  ROCM_IMAGE=1
+fi
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  if [[ -n "${ROCM_INFO}" || "${ROCM_IMAGE}" == "1" ]]; then
+    log_error "preflight: AMD ROCm runtime detected: ${ROCM_INFO:-ROCm image detected}"
+    log_error "preflight: H3 EntroPack requires NVIDIA CUDA 12.8+; AMD ROCm is not supported"
+    log_error "preflight: ROCm image ubuntu22.04-rocm7.2.3-py312-torch2.12.0-1.40.1 cannot run H3 EntroPack"
     log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
     exit 1
   fi
+  log_error "preflight: NVIDIA GPU is not visible and AMD ROCm was not detected"
+  log_error "preflight: create an NVIDIA CUDA GPU Notebook with: ${RECOMMENDED_IMAGE}"
+  exit 1
+fi
+if [[ -n "${ROCM_INFO}" ]]; then
+  log_warn "preflight: AMD ROCm also detected (${ROCM_INFO}); NVIDIA CUDA will be used"
+fi
+
+if [[ -z "${TRAINER_RUNTIME_PROFILE:-}" ]]; then
   CUDA_MAX="$(nvidia-smi 2>&1 | sed -n 's/.*CUDA Version: \([0-9][0-9.]*\).*/\1/p' | head -n1)"
   if [[ -z "${CUDA_MAX}" ]]; then
     log_error "preflight: cannot determine the driver CUDA capability"
@@ -80,6 +114,7 @@ if [[ -z "${TRAINER_BASE_IMAGE:-}" ]]; then
   fi
 fi
 log_info "preflight: selected H3 profile: ${TRAINER_RUNTIME_PROFILE}"
+log_info "preflight: system torch: ${SYSTEM_TORCH} (cuda=${SYSTEM_CUDA:-none}, hip=${SYSTEM_HIP:-none})"
 
 HOST_PYTHON_TAG="$(python3 -c 'import sys; print(f"py{sys.version_info.major}{sys.version_info.minor}")')"
 REQUIREMENTS_HASH="$(sha256sum "${ROOT_DIR}/requirements.txt" | awk '{print $1}')"

@@ -21,11 +21,21 @@ modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04
 - H3 使用 `entropack[cuda13]`
 - 不再推荐旧的 torch 2.0 / CUDA 11.7 WebUI 镜像
 
+### AMD ROCm 不支持 H3
+
+`ubuntu22.04-rocm7.2.3-py312-torch2.12.0-1.40.1` 不能运行本项目的 H3 工作流。H3 EntroPack 只提供 `entropack[cuda12]` / `entropack[cuda13]` 扩展，启动时强制检查 `torch.version.cuda` 与 `torch.cuda`；AMD ROCm 提供的 `torch.version.hip` 不会被当成 CUDA 使用。
+
+一键安装和启动脚本会检查镜像名、`torch.version.hip`、`rocm-smi`、`ROCM_PATH`、`HIP_PATH` 与 `/opt/rocm`。如果检测到 ROCm 且没有 `nvidia-smi`，会在安装 Python 环境或下载模型之前停止，并直接提示该 ROCm 镜像不支持。请改用推荐的 NVIDIA 镜像：
+
+```text
+modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04
+```
+
 启动器使用两个完全隔离的持久环境：`.venv` 只运行 Gradio WebUI，`.venv-h3` 专门安装 PyTorch、DiffSynth、EntroPack 和训练依赖。安装或修复 H3 环境不会再修改正在运行的 WebUI。更换容器导致 Python 版本变化时会自动重建两个虚拟环境；模型、Pose 图库、生成数据和 LoRA 输出不会删除。
 
 启动前会自动执行环境预检：
 
-- Python 3.10 以下或没有 NVIDIA GPU：停止，不下载模型，并显示推荐镜像。
+- Python 3.10 以下、AMD ROCm 或没有 NVIDIA GPU：停止，不下载模型，并显示推荐镜像。
 - 驱动 CUDA 13.0+：选择 `cu130` 配置继续。
 - 驱动 CUDA 12.8–12.x：提示推荐环境，选择 `cu128` 兼容配置继续。
 - 驱动 CUDA 低于 12.8：停止并推荐更换容器。

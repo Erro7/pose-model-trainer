@@ -43,9 +43,10 @@ DATASETS = HOME / "datasets"
 TOTAL_BUDGET_GB = float(os.environ.get("TRAINER_TOTAL_BUDGET_GB", "100"))
 MODEL_BUDGET_GB = float(os.environ.get("TRAINER_MODEL_BUDGET_GB", "80"))
 DATA_RESERVE_GB = max(0.0, TOTAL_BUDGET_GB - MODEL_BUDGET_GB)
+RECOMMENDED_IMAGE = "modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04"
 BASE_IMAGE = os.environ.get(
     "TRAINER_BASE_IMAGE",
-    "modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04",
+    RECOMMENDED_IMAGE,
 )
 RUNTIME_PROFILE = os.environ.get("TRAINER_RUNTIME_PROFILE", "cu130")
 for folder in (REPOS, MODELS, CONFIGS, OUTPUTS, LOGS, DATASETS):
@@ -128,6 +129,37 @@ def task_python_path() -> Path:
     return candidate if candidate.is_file() else Path(sys.executable)
 
 
+def detect_rocm_runtime() -> str:
+    markers = []
+    if "rocm" in BASE_IMAGE.lower():
+        markers.append(f"镜像 {BASE_IMAGE}")
+    rocm_root = Path(os.environ.get("ROCM_PATH") or os.environ.get("HIP_PATH") or "/opt/rocm")
+    if rocm_root.is_dir():
+        version = ""
+        try:
+            version = (rocm_root / ".info/version").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        markers.append(f"ROCm {version}" if version else f"ROCm 位于 {rocm_root}")
+    elif shutil.which("rocm-smi") or shutil.which("hipconfig"):
+        markers.append("已检测到 ROCm 工具")
+    return "；".join(dict.fromkeys(markers))
+
+
+ROCM_INFO = detect_rocm_runtime()
+
+
+def h3_gpu_support_error() -> str | None:
+    if shutil.which("nvidia-smi"):
+        return None
+    if ROCM_INFO:
+        return (
+            f"AMD ROCm（{ROCM_INFO}）不受支持；H3 EntroPack 需要 NVIDIA CUDA 12.8+。"
+            f"请改用 {RECOMMENDED_IMAGE}。"
+        )
+    return f"未检测到 NVIDIA GPU 或 AMD ROCm；请改用 {RECOMMENDED_IMAGE}。"
+
+
 def generation_hardware() -> dict:
     gpu_name, vram_gib = "", None
     try:
@@ -159,10 +191,11 @@ def generation_hardware() -> dict:
     else:
         safe_megapixels = min(vram_budget, ram_budget) or 0.26
     return {
-        "gpu_name": gpu_name or "未检测到 NVIDIA GPU",
+        "gpu_name": gpu_name or ("AMD ROCm（H3 不支持）" if ROCM_INFO else "未检测到 NVIDIA GPU"),
         "vram_gib": vram_gib,
         "ram_gib": ram_gib,
         "safe_megapixels": safe_megapixels,
+        "rocm_info": ROCM_INFO,
     }
 
 
@@ -193,7 +226,12 @@ def generation_size_options() -> tuple[list[str], str, str]:
         choices[0],
     )
 
-    if hardware["vram_gib"] is None:
+    if hardware["vram_gib"] is None and hardware["rocm_info"]:
+        gpu_text = (
+            f"AMD ROCm 环境（{hardware['rocm_info']}）；"
+            "H3 EntroPack 仅支持 NVIDIA CUDA 12.8+"
+        )
+    elif hardware["vram_gib"] is None:
         gpu_text = "未检测到 NVIDIA GPU；当前尺寸仅作预览，请先修复环境"
     else:
         gpu_text = f"{hardware['gpu_name']} · {hardware['vram_gib']:.1f} GiB 显存"
@@ -205,6 +243,8 @@ def generation_size_options() -> tuple[list[str], str, str]:
         f"可选常用尺寸：{available}\n"
         "安全预算同时考虑显存、系统内存与模型卸载需求；超出预算的自定义尺寸可能 OOM。"
     )
+    if hardware["rocm_info"] and hardware["vram_gib"] is None:
+        guidance += f"\n当前为 AMD ROCm，尺寸仅作预览，无法运行 H3；请改用 {RECOMMENDED_IMAGE}。"
     return choices, default_choice, guidance
 
 
@@ -298,10 +338,15 @@ def system_info() -> str:
         gpu = gpu_result.stdout.strip()
     except FileNotFoundError:
         gpu = ""
-    gpu = gpu or "未检测到 NVIDIA GPU"
+    if not gpu and ROCM_INFO:
+        gpu = f"AMD ROCm（{ROCM_INFO}）；H3 EntroPack 不支持，需要 NVIDIA CUDA 12.8+"
+    elif gpu and ROCM_INFO:
+        gpu = f"{gpu}；同时检测到 AMD ROCm（{ROCM_INFO}），H3 将使用 NVIDIA CUDA"
+    else:
+        gpu = gpu or "未检测到 NVIDIA GPU"
     disk = psutil.disk_usage(str(HOME))
     venv = "是" if sys.prefix != sys.base_prefix else "否"
-    return f"宿主镜像: {BASE_IMAGE}\nH3 运行配置: {RUNTIME_PROFILE}\nWebUI Python: {sys.executable}\nH3 任务 Python: {task_python_path()}\nWebUI 虚拟环境: {venv}\nGPU: {gpu}\nRAM: {psutil.virtual_memory().total / 2**30:.1f} GiB\n可用磁盘: {disk.free / 2**30:.1f} GiB\n工作目录: {HOME}"
+    return f"宿主镜像: {BASE_IMAGE}\n推荐 H3 镜像: {RECOMMENDED_IMAGE}\nH3 运行配置: {RUNTIME_PROFILE}\nWebUI Python: {sys.executable}\nH3 任务 Python: {task_python_path()}\nWebUI 虚拟环境: {venv}\nGPU: {gpu}\nRAM: {psutil.virtual_memory().total / 2**30:.1f} GiB\n可用磁盘: {disk.free / 2**30:.1f} GiB\n工作目录: {HOME}"
 
 
 def run_visible(command: str) -> str:
@@ -492,6 +537,11 @@ def _environment_progress(lines: list[str]) -> str:
 
 
 def start_h3_environment_setup() -> str:
+    gpu_error = h3_gpu_support_error()
+    if gpu_error:
+        result = f"[失败] {gpu_error}"
+        ENV_SETUP_RESULT.write_text(result, encoding="utf-8")
+        return result
     interpreter = task_python_path()
     script = ROOT / "ensure_h3_runtime.py"
     if not interpreter.is_file():
@@ -574,6 +624,10 @@ def health_check() -> str:
     lines.append(f"{passed if task_venv_ok else missing} H3 任务环境：{task_python_path()}")
     blocked = blocked or not venv_ok or not task_venv_ok
 
+    gpu_error = h3_gpu_support_error()
+    lines.append(f"{missing if gpu_error else passed} H3 GPU：{gpu_error or 'NVIDIA CUDA'}")
+    blocked = blocked or bool(gpu_error)
+
     writable = HOME.is_dir() and os.access(HOME, os.W_OK)
     lines.append(f"{passed if writable else missing} 持久目录：{HOME}")
     blocked = blocked or not writable
@@ -643,7 +697,9 @@ def health_check() -> str:
         f"{passed if loras else warning} LoRA 输出：{loras} 个",
     ])
 
-    if blocked:
+    if gpu_error:
+        next_step = gpu_error
+    elif blocked:
         next_step = "先修复上方标记为“缺失”的环境项目。"
     elif not candidates:
         next_step = "H3 工作流 → 1 · 生成目标图。"
@@ -891,6 +947,9 @@ def start_h3_generation(
     people, outfits, portrait_keyword, pose_keyword, costume_keyword,
     max_items, safe_only, job_name, instruction, size_choice, width, height, seed,
 ):
+    gpu_error = h3_gpu_support_error()
+    if gpu_error:
+        raise gr.Error(gpu_error)
     width, height = resolve_generation_size(size_choice, width, height)
     job_dir, summary = prepare_h3_generation_job(
         people, outfits, portrait_keyword, pose_keyword, costume_keyword,
@@ -906,6 +965,9 @@ def start_h3_lora(
     dataset_dir, output_name, model_profile, repeats, epochs,
     rank, lr, max_pixels, adapter_path, low_vram,
 ):
+    gpu_error = h3_gpu_support_error()
+    if gpu_error:
+        raise gr.Error(gpu_error)
     command, output_dir = build_h3_character_command(
         dataset_dir, output_name, model_profile, repeats, epochs,
         rank, lr, max_pixels, adapter_path, low_vram,
@@ -1391,6 +1453,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         )
         gr.Markdown(
             f"**宿主基线：** `{BASE_IMAGE}` ；H3 使用独立持久环境，不修改镜像自带 torch 2.0/cu117。\\n\\n"
+            "**GPU 要求：** NVIDIA CUDA 12.8+；AMD ROCm 镜像不能运行 H3 EntroPack。\\n\\n"
             "**固定策略：模型最多 80GB，生成数据与 LoRA 输出至少预留 20GB。** "
             "H3 会自动复用缓存；达到模型上限后停止新增下载。"
         )

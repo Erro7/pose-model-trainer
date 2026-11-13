@@ -78,30 +78,62 @@ else
   log_info "GitHub proxy: direct"
 fi
 
-log_info "preflight: checking Python and NVIDIA runtime"
+log_info "preflight: checking Python and GPU runtime"
 if ! command -v python3 >/dev/null 2>&1; then
   log_error "preflight: python3 is missing"
   log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
   exit 1
 fi
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  log_error "preflight: NVIDIA GPU is not visible"
-  log_error "preflight: create a GPU Notebook with: ${RECOMMENDED_IMAGE}"
-  exit 1
-fi
 
 PYTHON_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 PYTHON_OK="$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 10) else 0)')"
-NVIDIA_OUTPUT="$(nvidia-smi 2>&1 || true)"
-CUDA_MAX="$(printf '%s\n' "${NVIDIA_OUTPUT}" | sed -n 's/.*CUDA Version: \([0-9][0-9.]*\).*/\1/p' | head -n1)"
-GPU_INFO="$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
-SYSTEM_TORCH="$(python3 -c 'import torch; print(f"{torch.__version__} cuda={torch.version.cuda}")' 2>/dev/null || echo 'not installed')"
-
 if [[ "${PYTHON_OK}" != "1" ]]; then
   log_error "preflight: Python ${PYTHON_VERSION}; H3 requires Python 3.10+"
   log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
   exit 1
 fi
+
+SYSTEM_TORCH_INFO="$(python3 -c 'import torch; print(f"{torch.__version__}|{torch.version.cuda or ""}|{getattr(torch.version, "hip", "") or ""}")' 2>/dev/null || true)"
+if [[ -n "${SYSTEM_TORCH_INFO}" ]]; then
+  IFS='|' read -r SYSTEM_TORCH SYSTEM_CUDA SYSTEM_HIP <<< "${SYSTEM_TORCH_INFO}"
+else
+  SYSTEM_TORCH="not installed"
+  SYSTEM_CUDA=""
+  SYSTEM_HIP=""
+fi
+
+ROCM_INFO=""
+ROCM_IMAGE=0
+if [[ -n "${SYSTEM_HIP}" ]]; then
+  ROCM_INFO="torch HIP ${SYSTEM_HIP}"
+elif command -v rocm-smi >/dev/null 2>&1 || [[ -d /opt/rocm ]] || [[ -n "${ROCM_PATH:-}" || -n "${HIP_PATH:-}" ]]; then
+  ROCM_ROOT="${ROCM_PATH:-${HIP_PATH:-/opt/rocm}}"
+  ROCM_VERSION="$(cat "${ROCM_ROOT}/.info/version" 2>/dev/null || true)"
+  ROCM_INFO="${ROCM_VERSION:-ROCm installation detected}"
+fi
+if [[ -n "${TRAINER_BASE_IMAGE:-}" && "${TRAINER_BASE_IMAGE,,}" == *rocm* ]]; then
+  ROCM_IMAGE=1
+fi
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  if [[ -n "${ROCM_INFO}" || "${ROCM_IMAGE}" == "1" ]]; then
+    log_error "preflight: AMD ROCm runtime detected: ${ROCM_INFO:-ROCm image detected}"
+    log_error "preflight: H3 EntroPack requires NVIDIA CUDA 12.8+; AMD ROCm is not supported"
+    log_error "preflight: ROCm image ubuntu22.04-rocm7.2.3-py312-torch2.12.0-1.40.1 cannot run H3 EntroPack"
+    log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
+    exit 1
+  fi
+  log_error "preflight: NVIDIA GPU is not visible and AMD ROCm was not detected"
+  log_error "preflight: create an NVIDIA CUDA GPU Notebook with: ${RECOMMENDED_IMAGE}"
+  exit 1
+fi
+if [[ -n "${ROCM_INFO}" ]]; then
+  log_warn "preflight: AMD ROCm also detected (${ROCM_INFO}); NVIDIA CUDA will be used"
+fi
+
+NVIDIA_OUTPUT="$(nvidia-smi 2>&1 || true)"
+CUDA_MAX="$(printf '%s\n' "${NVIDIA_OUTPUT}" | sed -n 's/.*CUDA Version: \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+GPU_INFO="$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
 if [[ -z "${CUDA_MAX}" ]]; then
   log_error "preflight: cannot determine the driver CUDA capability"
   log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
@@ -132,7 +164,7 @@ log_info "preflight: result: ${PREFLIGHT_RESULT}"
 log_info "preflight: Python: ${PYTHON_VERSION}"
 log_info "preflight: GPU: ${GPU_INFO:-unknown}"
 log_info "preflight: driver CUDA: ${CUDA_MAX}"
-log_info "preflight: system torch: ${SYSTEM_TORCH}"
+log_info "preflight: system torch: ${SYSTEM_TORCH} (cuda=${SYSTEM_CUDA:-none}, hip=${SYSTEM_HIP:-none})"
 log_info "preflight: selected H3 profile: ${TRAINER_RUNTIME_PROFILE}"
 if [[ "${PREFLIGHT_RESULT}" != "recommended" || "${PYTHON_VERSION}" != "3.12" ]]; then
   log_warn "preflight: continuing with an isolated compatible runtime"

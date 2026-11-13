@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,9 +17,10 @@ except ImportError:
 HOME = Path(os.environ.get("TRAINER_HOME", "/mnt/workspace/pose-model-trainer-data")).expanduser().resolve()
 DIFFSYNTH = HOME / "repos" / "DiffSynth-Studio"
 REQUIRED = ("torch", "torchvision", "diffsynth", "entropack", "cupy", "accelerate")
+RECOMMENDED_IMAGE = "modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04"
 BASE_IMAGE = os.environ.get(
     "TRAINER_BASE_IMAGE",
-    "modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04",
+    RECOMMENDED_IMAGE,
 )
 
 RUNTIME_PROFILE = os.environ.get("TRAINER_RUNTIME_PROFILE", "").lower()
@@ -68,6 +70,50 @@ print(f'cuda_ready=true gpu={{torch.cuda.get_device_name(0)}} vram_gb={{total / 
 
 def missing_modules() -> list[str]:
     return [name for name in REQUIRED if importlib.util.find_spec(name) is None]
+
+
+def rocm_runtime_info() -> str:
+    markers = []
+    if "rocm" in BASE_IMAGE.lower():
+        markers.append(f"image {BASE_IMAGE}")
+
+    try:
+        import torch
+
+        hip = getattr(torch.version, "hip", None)
+        if hip:
+            markers.append(f"torch HIP {hip}")
+    except Exception:
+        pass
+
+    rocm_root = Path(os.environ.get("ROCM_PATH") or os.environ.get("HIP_PATH") or "/opt/rocm")
+    if rocm_root.is_dir():
+        version = ""
+        try:
+            version = (rocm_root / ".info/version").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        markers.append(f"ROCm {version}" if version else f"ROCm at {rocm_root}")
+    elif shutil.which("rocm-smi") or shutil.which("hipconfig"):
+        markers.append("ROCm tools detected")
+
+    return ", ".join(dict.fromkeys(markers))
+
+
+def gpu_support_error(rocm_info: str, nvidia_visible: bool) -> str | None:
+    if nvidia_visible:
+        return None
+    if rocm_info:
+        return (
+            "H3 EntroPack requires NVIDIA CUDA 12.8+; AMD ROCm is not supported. "
+            f"Detected: {rocm_info}. "
+            "Image ubuntu22.04-rocm7.2.3-py312-torch2.12.0-1.40.1 cannot run H3 EntroPack. "
+            f"Use an NVIDIA CUDA GPU Notebook with {RECOMMENDED_IMAGE}."
+        )
+    return (
+        "NVIDIA GPU is not visible and AMD ROCm was not detected. "
+        f"Use an NVIDIA CUDA GPU Notebook with {RECOMMENDED_IMAGE}."
+    )
 
 
 def run(command: list[str], env: dict[str, str] | None = None) -> None:
@@ -137,6 +183,17 @@ def main() -> None:
             "H3 runtime must run inside the project virtual environment; "
             f"received {sys.executable}"
         )
+
+    rocm_info = rocm_runtime_info()
+    nvidia_visible = shutil.which("nvidia-smi") is not None
+    if rocm_info and nvidia_visible:
+        print(
+            f"[runtime] warning: AMD ROCm also detected ({rocm_info}); NVIDIA CUDA will be used",
+            flush=True,
+        )
+    support_error = gpu_support_error(rocm_info, nvidia_visible)
+    if support_error:
+        raise SystemExit(f"[runtime] {support_error}")
 
     lock = acquire_lock()
     if lock is not None:
