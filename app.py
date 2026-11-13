@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from collections import deque
 from pathlib import Path
 
@@ -40,6 +41,7 @@ CONFIGS = HOME / "configs"
 OUTPUTS = HOME / "outputs"
 LOGS = HOME / "logs"
 DATASETS = HOME / "datasets"
+EXPORTS = HOME / "exports"
 TOTAL_BUDGET_GB = float(os.environ.get("TRAINER_TOTAL_BUDGET_GB", "100"))
 MODEL_BUDGET_GB = float(os.environ.get("TRAINER_MODEL_BUDGET_GB", "80"))
 DATA_RESERVE_GB = max(0.0, TOTAL_BUDGET_GB - MODEL_BUDGET_GB)
@@ -50,7 +52,7 @@ BASE_IMAGE = os.environ.get(
 )
 RUNTIME_PROFILE = os.environ.get("TRAINER_RUNTIME_PROFILE", "cu130")
 GPU_VENDOR = os.environ.get("TRAINER_GPU_VENDOR", "").strip().lower()
-for folder in (REPOS, MODELS, CONFIGS, OUTPUTS, LOGS, DATASETS):
+for folder in (REPOS, MODELS, CONFIGS, OUTPUTS, LOGS, DATASETS, EXPORTS):
     folder.mkdir(parents=True, exist_ok=True)
 LATEST_LOG = LOGS / "latest.log"
 LATEST_LOG.touch(exist_ok=True)
@@ -822,12 +824,6 @@ def prepare_h3_character_dataset(
                 pose_files.append(path)
     if not target_files:
         raise gr.Error("至少需要一张目标成品图作为监督输出")
-    if not people_files:
-        raise gr.Error("至少需要一张人物参考图；人物参考支持多张")
-    if not outfit_files:
-        raise gr.Error("至少需要一张服装参考图")
-    if not pose_files:
-        raise gr.Error("至少需要一张 Pose 参考图或有效的本地 Pose 路径")
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", job_name.strip()).strip("-.") or "h3-character"
     root = _new_dataset_root(safe_name)
     image_dir, ref_dir = root / "targets", root / "references"
@@ -837,34 +833,53 @@ def prepare_h3_character_dataset(
     for prefix, files in (("person", people_files), ("outfit", outfit_files), ("pose", pose_files)):
         for index, source in enumerate(files, 1):
             reference_names.append(f"references/{_copy_named(source, ref_dir, prefix, index)}")
-    person_end = len(people_files)
-    outfit_end = person_end + len(outfit_files)
-    role_hint = (
-        f"Pictures 1-{person_end} are identity references; "
-        f"Pictures {person_end + 1}-{outfit_end} are outfit references; "
-        f"Pictures {outfit_end + 1}-{len(reference_names)} are pose references."
-    )
+    role_hints = []
+    picture = 1
+    for label, files in (
+        ("identity", people_files), ("outfit", outfit_files), ("pose", pose_files),
+    ):
+        if not files:
+            continue
+        end = picture + len(files) - 1
+        subject = f"Picture {picture}" if picture == end else f"Pictures {picture}-{end}"
+        role_hints.append(f"{subject} {'is an' if picture == end else 'are'} {label} reference{'s' if picture != end else ''}.")
+        picture = end + 1
+    role_hint = " ".join(role_hints)
     prompt = " ".join(x for x in (trigger_word.strip(), role_hint, instruction.strip()) if x)
     records = []
     for index, source in enumerate(target_files, 1):
         target_name = f"targets/{_copy_named(source, image_dir, 'target', index)}"
-        records.append({"image": target_name, "prompt": prompt, "edit_image": reference_names})
+        record = {"image": target_name, "prompt": prompt}
+        if reference_names:
+            record["edit_image"] = reference_names
+        records.append(record)
     metadata = root / "metadata.json"
     metadata.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
     summary = (
         f"任务目录：{root}\n目标图：{len(target_files)}\n人物参考：{len(people_files)}\n"
         f"服装参考：{len(outfit_files)}\nPose 参考：{len(pose_files)}\n"
-        f"每个样本参考图总数：{len(reference_names)}\nMetadata：{metadata}"
+        f"每个样本参考图总数：{len(reference_names)}\n"
+        f"训练模式：{'参考图编辑' if reference_names else '仅目标图（文生图）'}\nMetadata：{metadata}"
     )
     return str(root), summary
 
 
-def prepare_h3_generation_job(people, outfits, portrait_keyword, keyword, costume_keyword, max_items, safe_only, job_name, instruction):
-    people_files, outfit_files = _upload_paths(people), _upload_paths(outfits)
-    gallery, needle = pose_gallery_root(require_data=True), (keyword or "").strip().lower()
+def prepare_h3_generation_job(people, outfits, poses, portrait_keyword, keyword, costume_keyword, max_items, safe_only, job_name, instruction):
+    people_files = _upload_paths(people)
+    outfit_files = _upload_paths(outfits)
+    pose_files = _upload_paths(poses)
+    needle = (keyword or "").strip().lower()
+    gallery_cache: Path | None = None
+
+    def gallery() -> Path:
+        nonlocal gallery_cache
+        if gallery_cache is None:
+            gallery_cache = pose_gallery_root(require_data=True)
+        return gallery_cache
+
     portrait_item = None
     if not people_files:
-        portrait_index = gallery / "data/portrait-zh.json"
+        portrait_index = gallery() / "data/portrait-zh.json"
         if not portrait_index.is_file():
             raise gr.Error("Pose 仓库缺少 data/portrait-zh.json，请重新同步完整图库")
         portrait_needle = (portrait_keyword or "").strip().lower()
@@ -873,33 +888,42 @@ def prepare_h3_generation_job(people, outfits, portrait_keyword, keyword, costum
             searchable = " ".join(str(item.get(k, "")) for k in ("id", "分区", "发长", "发型名称", "标题", "检索"))
             if portrait_needle and portrait_needle not in searchable.lower():
                 continue
-            source = gallery / item.get("原图", "")
+            source = gallery() / item.get("原图", "")
             if source.is_file():
                 portraits.append((item, source))
         if not portraits:
             raise gr.Error("人像库中没有符合条件且已下载的人物；可清空关键词或重新同步图库")
         portrait_item, portrait_path = random.SystemRandom().choice(portraits)
         people_files = [portrait_path]
-    index = gallery / "data/pose-zh.json"
-    if not index.is_file():
-        raise gr.Error("请先在“姿势图库”页同步 Pose 仓库")
-    selected = []
-    for item in json.loads(index.read_text(encoding="utf-8")):
-        searchable = " ".join(str(item.get(k, "")) for k in ("体系", "分类", "姿势名称", "角度", "检索"))
-        if needle and needle not in searchable.lower():
-            continue
-        if safe_only and any(word in searchable for word in ("性感", "双人缠绵")):
-            continue
-        pose = gallery / item.get("原图", "")
-        if pose.is_file():
-            selected.append((item, pose))
-        if len(selected) >= int(max_items):
-            break
+    if pose_files:
+        selected = [
+            ({
+                "id": f"uploaded-pose-{index}", "体系": "uploaded", "分类": "custom",
+                "姿势名称": f"Uploaded pose {index}", "角度": "reference",
+            }, path)
+            for index, path in enumerate(pose_files[:int(max_items)], 1)
+        ]
+    else:
+        index = gallery() / "data/pose-zh.json"
+        if not index.is_file():
+            raise gr.Error("请先在“姿势图库”页同步 Pose 仓库，或上传自定义 Pose 参考图")
+        selected = []
+        for item in json.loads(index.read_text(encoding="utf-8")):
+            searchable = " ".join(str(item.get(k, "")) for k in ("体系", "分类", "姿势名称", "角度", "检索"))
+            if needle and needle not in searchable.lower():
+                continue
+            if safe_only and any(word in searchable for word in ("性感", "双人缠绵")):
+                continue
+            pose = gallery() / item.get("原图", "")
+            if pose.is_file():
+                selected.append((item, pose))
+            if len(selected) >= int(max_items):
+                break
     if not selected:
-        raise gr.Error("Pose 仓库中没有符合条件的姿势")
+        raise gr.Error("没有可用的 Pose 参考图；请调整筛选条件或上传自定义 Pose")
     costumes = []
     if not outfit_files:
-        costume_index = gallery / "data/costume-zh.json"
+        costume_index = gallery() / "data/costume-zh.json"
         if not costume_index.is_file():
             raise gr.Error("Pose 仓库缺少 data/costume-zh.json，请重新同步图库")
         costume_needle = (costume_keyword or "").strip().lower()
@@ -909,7 +933,7 @@ def prepare_h3_generation_job(people, outfits, portrait_keyword, keyword, costum
                 continue
             if safe_only and any(word in searchable for word in ("内衣", "性感", "泳装")):
                 continue
-            source = gallery / item.get("原图", "")
+            source = gallery() / item.get("原图", "")
             if source.is_file():
                 costumes.append((item, source))
         if not costumes:
@@ -930,7 +954,7 @@ def prepare_h3_generation_job(people, outfits, portrait_keyword, keyword, costum
             outfit_names = [f"references/{_copy_named(costume_path, refs, 'costume', i)}"]
         pose_name = f"references/{_copy_named(pose_path, refs, 'pose', i)}"
         all_refs = person_names + outfit_names + [pose_name]
-        person_range = f"<Picture 1>" if len(person_names) == 1 else f"<Picture 1>-<Picture {len(person_names)}>"
+        person_range = "<Picture 1>" if len(person_names) == 1 else f"<Picture 1>-<Picture {len(person_names)}>"
         outfit_start = len(person_names) + 1
         outfit_range = f"<Picture {outfit_start}>" if len(outfit_names) == 1 else f"<Picture {outfit_start}>-<Picture {outfit_start + len(outfit_names) - 1}>"
         pose_number = len(all_refs)
@@ -953,7 +977,12 @@ def prepare_h3_generation_job(people, outfits, portrait_keyword, keyword, costum
     (root / "generation.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     person_source = "上传人物" if portrait_item is None else f"仓库随机人物：{portrait_item.get('id', '')} · {portrait_item.get('标题', '')}"
     outfit_source = "上传的服装参考" if outfit_files else "仓库服装库"
-    return str(root), f"已构造 {len(manifest)} 个生成任务。\n人物：{person_source}\n服装：{outfit_source}\n同一批次固定同一人物，提示词由人物、服装与 Pose 字段自动组合。"
+    pose_source = "上传的 Pose 参考" if pose_files else "仓库 Pose 库"
+    return str(root), (
+        f"已构造 {len(manifest)} 个生成任务。\n人物：{person_source}\n"
+        f"服装：{outfit_source}\nPose：{pose_source}\n"
+        "同一批次固定同一人物，提示词由人物、服装与 Pose 字段自动组合。"
+    )
 
 
 def build_h3_generation_command(job_dir, width, height, seed):
@@ -972,7 +1001,7 @@ def build_h3_generation_command(job_dir, width, height, seed):
 
 
 def start_h3_generation(
-    people, outfits, portrait_keyword, pose_keyword, costume_keyword,
+    people, outfits, poses, portrait_keyword, pose_keyword, costume_keyword,
     max_items, safe_only, job_name, instruction, size_choice, width, height, seed,
 ):
     gpu_error = h3_gpu_support_error()
@@ -980,7 +1009,7 @@ def start_h3_generation(
         raise gr.Error(gpu_error)
     width, height = resolve_generation_size(size_choice, width, height)
     job_dir, summary = prepare_h3_generation_job(
-        people, outfits, portrait_keyword, pose_keyword, costume_keyword,
+        people, outfits, poses, portrait_keyword, pose_keyword, costume_keyword,
         max_items, safe_only, job_name, instruction,
     )
     command = build_h3_generation_command(job_dir, width, height, seed)
@@ -1059,7 +1088,14 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
     dataset = Path(dataset_dir).expanduser().resolve()
     metadata = dataset / "metadata.json"
     if not metadata.is_file():
-        raise gr.Error("找不到 metadata.json，请先生成三合一训练数据集")
+        raise gr.Error("找不到 metadata.json，请先生成训练数据集")
+    records = json.loads(metadata.read_text(encoding="utf-8"))
+    if not records:
+        raise gr.Error("metadata.json 为空，请重新创建训练数据集")
+    edit_flags = [bool(record.get("edit_image")) for record in records]
+    if any(edit_flags) and not all(edit_flags):
+        raise gr.Error("数据集中的 edit_image 不一致；请统一为全部带参考图或全部仅目标图")
+    data_inputs = "--data_file_keys image,edit_image --extra_inputs edit_image" if all(edit_flags) else "--data_file_keys image"
     script = REPOS / "DiffSynth-Studio/examples/minimax_h3_image/model_training/train.py"
     if not script.is_file():
         raise gr.Error("尚未安装 DiffSynth-Studio，请先在“环境”页安装训练后端")
@@ -1076,7 +1112,7 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
     )
     targets = "attn.qkv_proj,attn.out_proj,mlp.fc1,mlp.fc2"
     common_tail = (
-        f"--data_file_keys image,edit_image --extra_inputs edit_image --max_pixels {int(max_pixels)} "
+        f"{data_inputs} --max_pixels {int(max_pixels)} "
         f"--learning_rate {float(lr)} --remove_prefix_in_ckpt pipe.dit. --lora_base_model dit "
         f"--lora_target_modules {q(targets)} --lora_rank {int(rank)} --use_gradient_checkpointing"
     )
@@ -1345,6 +1381,7 @@ def restore_task_ui() -> tuple:
             h3_command = gr.update(value=task.get("command", ""))
         if task.get("kind") == "train":
             train_command = gr.update(value=task.get("command", ""))
+    artifacts = load_artifact_library()
     return (
         *_task_statuses(task),
         auto_job,
@@ -1355,6 +1392,7 @@ def restore_task_ui() -> tuple:
         h3_command,
         train_command,
         *_task_button_updates(task),
+        *artifacts,
     )
 
 
@@ -1472,6 +1510,207 @@ def list_lora_outputs(output_dir: str):
     return [str(path) for path in sorted(root.rglob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)]
 
 
+def _job_target_files(job: Path) -> list[Path]:
+    paths: list[Path] = []
+    manifest_file = job / "generation.json"
+    if manifest_file.is_file():
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = []
+        for item in manifest:
+            path = job / "targets" / str(item.get("output", ""))
+            if path.is_file():
+                paths.append(path)
+    if not paths:
+        target_dir = job / "targets"
+        if target_dir.is_dir():
+            paths = sorted(
+                path for path in target_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+            )
+    return list(dict.fromkeys(paths))
+
+
+def _artifact_job_choices(selected=None) -> tuple[list[tuple[str, str]], list[str]]:
+    jobs = []
+    for job in DATASETS.iterdir():
+        if not job.is_dir():
+            continue
+        targets = _job_target_files(job)
+        if not targets:
+            continue
+        try:
+            updated = max(path.stat().st_mtime for path in targets)
+        except OSError:
+            updated = job.stat().st_mtime
+        label = f"{job.name} · {len(targets)} 张 · {time.strftime('%m-%d %H:%M', time.localtime(updated))}"
+        jobs.append((updated, label, job))
+    jobs.sort(key=lambda item: item[0], reverse=True)
+    choices = [(label, str(job)) for _, label, job in jobs]
+    valid = {value for _, value in choices}
+    current = selected if isinstance(selected, list) else ([selected] if selected else [])
+    values = [value for value in current if value in valid]
+    if not values and choices:
+        values = [choices[0][1]]
+    return choices, values
+
+
+def _selected_artifact_jobs(job_dirs) -> list[Path]:
+    values = job_dirs if isinstance(job_dirs, list) else ([job_dirs] if job_dirs else [])
+    root = DATASETS.resolve()
+    jobs = []
+    for value in values:
+        path = Path(str(value)).expanduser().resolve()
+        if path == root or root not in path.parents or not path.is_dir():
+            raise gr.Error(f"成果批次路径无效：{value}")
+        jobs.append(path)
+    if not jobs:
+        raise gr.Error("请先选择至少一个成果批次")
+    return jobs
+
+
+def preview_artifact_jobs(job_dirs):
+    jobs = _selected_artifact_jobs(job_dirs)
+    gallery = []
+    lines = []
+    shown = 0
+    for job in jobs:
+        targets = _job_target_files(job)
+        lines.append(f"{job.name}：{len(targets)} 张目标图 · {'已有 metadata' if (job / 'metadata.json').is_file() else '尚未整理训练集'}")
+        for path in targets:
+            if shown >= 240:
+                break
+            gallery.append((str(path), f"{job.name} · {path.name}"))
+            shown += 1
+    if shown >= 240 and sum(len(_job_target_files(job)) for job in jobs) > shown:
+        lines.append(f"预览仅显示前 {shown} 张；下载 ZIP 会包含全部文件。")
+    return gallery, "\n".join(lines)
+
+
+def refresh_artifact_library(selected=None):
+    choices, values = _artifact_job_choices(selected)
+    gallery, status = preview_artifact_jobs(values) if values else ([], "还没有可用的生成批次。")
+    return (
+        gr.update(choices=choices, value=values, interactive=bool(choices)),
+        gallery,
+        status,
+        list_all_lora_outputs(),
+    )
+
+
+def load_artifact_library():
+    choices, values = _artifact_job_choices()
+    gallery, status = preview_artifact_jobs(values) if values else ([], "还没有可用的生成批次。")
+    return (
+        gr.update(choices=choices, value=values, interactive=bool(choices)),
+        gallery,
+        status,
+        list_all_lora_outputs(),
+    )
+
+
+def poll_artifact_job_choices(selected=None):
+    choices, values = _artifact_job_choices(selected)
+    return gr.update(choices=choices, value=values, interactive=bool(choices))
+
+
+def load_artifact_preview(job_dirs):
+    return preview_artifact_jobs(job_dirs)
+
+
+def use_artifact_for_review(job_dirs):
+    jobs = _selected_artifact_jobs(job_dirs)
+    job = jobs[0]
+    gallery, _ = preview_artifact_jobs([str(job)])
+    extra = f"；另有 {len(jobs) - 1} 个批次未载入" if len(jobs) > 1 else ""
+    return str(job), gallery, f"已把 {job.name} 载入“2 · 筛选整理”{extra}。"
+
+
+def use_artifact_as_dataset(job_dirs, trigger_word: str):
+    jobs = _selected_artifact_jobs(job_dirs)
+    job = jobs[0]
+    metadata = job / "metadata.json"
+    if metadata.is_file():
+        return str(job), f"已载入训练数据集：{job.name}。"
+
+    trigger = (trigger_word or "ohwx person").strip()
+    records, skipped = [], 0
+    manifest_file = job / "generation.json"
+    if manifest_file.is_file():
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        for item in manifest:
+            target = job / "targets" / str(item.get("output", ""))
+            if not target.is_file():
+                skipped += 1
+                continue
+            record = {"image": f"targets/{target.name}", "prompt": " ".join((trigger, str(item.get("prompt", "")).strip())).strip()}
+            refs = [job / str(path) for path in item.get("edit_image", [])]
+            if refs and all(path.is_file() for path in refs):
+                record["edit_image"] = [str(path.relative_to(job)) for path in refs]
+            elif refs:
+                skipped += 1
+                continue
+            records.append(record)
+    else:
+        for target in _job_target_files(job):
+            records.append({"image": f"targets/{target.name}", "prompt": trigger})
+    if not records:
+        raise gr.Error("这个批次没有可用目标图或参考图，无法创建训练集")
+    metadata.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    note = f"，跳过 {skipped} 个缺失文件样本" if skipped else ""
+    return str(job), f"已为 {job.name} 创建 metadata.json，共 {len(records)} 个样本{note}。"
+
+
+def _write_artifact_zip(jobs: list[Path], filename: str) -> tuple[Path, int]:
+    export = EXPORTS / filename
+    if export.exists():
+        export.unlink()
+    file_count = 0
+    with zipfile.ZipFile(export, "w", compression=zipfile.ZIP_STORED) as archive:
+        for job in jobs:
+            for path in sorted(job.rglob("*")):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(job)
+                include = relative.parts[0] in {"targets", "references"} or relative.name in {
+                    "generation.json", "metadata.json",
+                }
+                if not include:
+                    continue
+                archive.write(path, arcname=f"{job.name}/{relative.as_posix()}")
+                file_count += 1
+    return export, file_count
+
+
+def download_artifact_jobs(job_dirs):
+    jobs = _selected_artifact_jobs(job_dirs)
+    export, count = _write_artifact_zip(jobs, f"h3-materials-{time.strftime('%Y%m%d-%H%M%S')}.zip")
+    names = "、".join(job.name for job in jobs)
+    return gr.update(value=str(export), interactive=True), f"已打包 {len(jobs)} 个批次、{count} 个文件：{names}"
+
+
+def list_all_lora_outputs():
+    root = OUTPUTS.resolve()
+    if not root.is_dir():
+        return []
+    return [
+        str(path) for path in sorted(root.rglob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)
+    ]
+
+
+def download_all_lora_outputs():
+    outputs = [Path(path) for path in list_all_lora_outputs()]
+    if not outputs:
+        raise gr.Error("还没有可下载的 LoRA 输出")
+    root = OUTPUTS.resolve()
+    export = EXPORTS / f"h3-lora-outputs-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    with zipfile.ZipFile(export, "w", compression=zipfile.ZIP_STORED) as archive:
+        for path in outputs:
+            archive.write(path, arcname=f"outputs/{path.relative_to(root).as_posix()}")
+    return gr.update(value=str(export), interactive=True), f"已打包 {len(outputs)} 个 LoRA 文件。"
+
+
 generation_size_choices, generation_size_default, generation_size_guidance = generation_size_options()
 
 
@@ -1573,10 +1812,14 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     lines=2,
                 )
                 with gr.Accordion("自定义参考（可选）", open=False):
-                    gr.Markdown("上传后会覆盖对应的图库随机参考。")
+                    gr.Markdown(
+                        "上传任意一类或全部素材后，会覆盖对应的图库随机参考；未上传的类型继续从图库选择。"
+                        "自定义 Pose 不受图库 18+ 分类过滤影响，请自行确认素材。"
+                    )
                     with gr.Row():
-                        auto_people = gr.Files(label="自定义人物", file_types=["image"])
-                        auto_outfits = gr.Files(label="自定义服装", file_types=["image"])
+                        auto_people = gr.Files(label="自定义人物（可选）", file_types=["image"])
+                        auto_outfits = gr.Files(label="自定义服装（可选）", file_types=["image"])
+                        auto_poses = gr.Files(label="自定义 Pose（可选）", file_types=["image"])
                 with gr.Accordion("自定义尺寸与任务参数（高级）", open=False):
                     gr.Markdown("常用尺寸会自动带入；只有选择“自定义尺寸（高级）”时才使用下面宽高。宽高需为 16 的倍数且不能超过安全预算。")
                     with gr.Row():
@@ -1669,13 +1912,16 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                 h3_outputs = gr.Files(label="LoRA 输出文件", interactive=False)
 
             with gr.Tab("4 · 手动数据（高级）"):
-                gr.Markdown("仅在已有目标成品图时使用。常规流程无需操作本页。")
+                gr.Markdown(
+                    "仅在已有目标成品图时使用。常规流程无需操作本页。"
+                    "目标成品图必填；人物、服装、Pose 参考均可留空，留空时创建纯目标图文生图训练集。"
+                )
                 with gr.Row():
-                    h3_targets = gr.Files(label="目标成品图", file_types=["image"])
-                    h3_people = gr.Files(label="人物参考图", file_types=["image"])
+                    h3_targets = gr.Files(label="目标成品图（必填）", file_types=["image"])
+                    h3_people = gr.Files(label="人物参考图（可选）", file_types=["image"])
                 with gr.Row():
-                    h3_outfits = gr.Files(label="服装参考图", file_types=["image"])
-                    h3_poses = gr.Files(label="Pose 参考图", file_types=["image"])
+                    h3_outfits = gr.Files(label="服装参考图（可选）", file_types=["image"])
+                    h3_poses = gr.Files(label="Pose 参考图（可选）", file_types=["image"])
                 h3_pose_paths = gr.Textbox(
                     label="Pose 本地路径（可选）",
                     placeholder="每行或逗号分隔",
@@ -1685,17 +1931,43 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                         h3_job = gr.Textbox(value="character-3in1", label="任务名称")
                         h3_trigger = gr.Textbox(value="ohwx person", label="人物触发词")
                     h3_instruction = gr.Textbox(
-                        value="Create the same person wearing the referenced outfit and following the referenced pose. Preserve identity, facial features and body proportions.",
+                        value="Create a high-quality realistic image. Preserve identity, facial features, body proportions and any details supplied by the optional references.",
                         label="训练指令",
                         lines=3,
                     )
                 h3_prepare = gr.Button("创建手动训练集", variant="primary")
                 h3_dataset_summary = gr.Textbox(label="数据集摘要", lines=6)
 
+            with gr.Tab("5 · 成果库"):
+                gr.Markdown(
+                    "所有生成批次（含手动数据）都持久保存在 `TRAINER_HOME/datasets`，刷新页面或重启 WebUI 后仍可查看。"
+                    "可多选批次后批量下载 ZIP，或直接载入筛选、创建训练集。"
+                )
+                with gr.Row():
+                    artifact_refresh = gr.Button("刷新成果库", variant="primary")
+                    artifact_download = gr.DownloadButton("批量下载选中批次 ZIP", value=None)
+                artifact_jobs = gr.Dropdown(
+                    choices=[],
+                    value=[],
+                    multiselect=True,
+                    label="成果批次（可多选）",
+                )
+                artifact_status = gr.Textbox(label="成果摘要", lines=4, interactive=False)
+                artifact_gallery = gr.Gallery(label="成果预览", columns=5, height="auto")
+                with gr.Row():
+                    artifact_load_review = gr.Button("载入到筛选整理")
+                    artifact_trigger = gr.Textbox(value="ohwx person", label="创建训练集时的人物触发词")
+                    artifact_load_train = gr.Button("作为训练集使用", variant="primary")
+                gr.Markdown("### LoRA 训练成品\n`TRAINER_HOME/outputs` 中的 `.safetensors` 会自动收集，可在刷新页面后继续下载。")
+                with gr.Row():
+                    artifact_outputs_refresh = gr.Button("刷新 LoRA 输出")
+                    artifact_outputs_download = gr.DownloadButton("打包下载全部 LoRA", value=None)
+                artifact_outputs = gr.Files(label="历史 LoRA 输出文件", interactive=False)
+
         auto_start.click(
             start_h3_generation,
             [
-                auto_people, auto_outfits, auto_portrait_keyword,
+                auto_people, auto_outfits, auto_poses, auto_portrait_keyword,
                 auto_pose_keyword, auto_costume_keyword, auto_pose_count,
                 auto_pose_safe, auto_job_name, auto_instruction,
                 auto_size, auto_width, auto_height, auto_seed,
@@ -1731,6 +2003,43 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         h3_log_timer.tick(read_log, inputs=h3_log_lines, outputs=h3_log)
         h3_log_refresh.click(read_log, inputs=h3_log_lines, outputs=h3_log)
         h3_outputs_refresh.click(list_lora_outputs, h3_lora_path, h3_outputs)
+
+        artifact_refresh.click(
+            refresh_artifact_library,
+            artifact_jobs,
+            [artifact_jobs, artifact_gallery, artifact_status, artifact_outputs],
+        )
+        artifact_jobs.change(
+            load_artifact_preview,
+            artifact_jobs,
+            [artifact_gallery, artifact_status],
+        )
+        artifact_download.click(
+            download_artifact_jobs,
+            artifact_jobs,
+            [artifact_download, artifact_status],
+        )
+        artifact_load_review.click(
+            use_artifact_for_review,
+            artifact_jobs,
+            [auto_job_dir, auto_gallery, artifact_status],
+        )
+        artifact_load_train.click(
+            use_artifact_as_dataset,
+            [artifact_jobs, artifact_trigger],
+            [h3_dataset, artifact_status],
+        )
+        artifact_outputs_refresh.click(list_all_lora_outputs, outputs=artifact_outputs)
+        artifact_outputs_download.click(
+            download_all_lora_outputs,
+            outputs=[artifact_outputs_download, artifact_status],
+        )
+        artifact_jobs_timer = gr.Timer(value=5.0, active=True)
+        artifact_jobs_timer.tick(
+            poll_artifact_job_choices,
+            artifact_jobs,
+            artifact_jobs,
+        )
 
         h3_prepare.click(
             prepare_h3_character_dataset,
@@ -1798,6 +2107,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
             auto_job_dir, auto_summary, auto_command,
             h3_dataset, h3_lora_path, h3_command, command,
             auto_start, auto_stop, h3_start, h3_stop, start, stop,
+            artifact_jobs, artifact_gallery, artifact_status, artifact_outputs,
         ],
     )
 
@@ -1811,6 +2121,6 @@ if __name__ == "__main__":
         server_port=server_port,
         share=share_enabled,
         root_path=root_path,
-        allowed_paths=[str(OUTPUTS), str(DATASETS), str(LOGS)],
+        allowed_paths=[str(OUTPUTS), str(DATASETS), str(LOGS), str(EXPORTS)],
         show_error=True,
     )
