@@ -21,10 +21,16 @@ import uuid
 from collections import deque
 from pathlib import Path
 
-import gradio as gr
-from loguru import logger
-import psutil
-import toml
+try:
+    import gradio as gr
+    from loguru import logger
+    import psutil
+    import toml
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        f"WebUI 依赖缺失：{exc.name}。请使用 `bash start.sh` 启动，"
+        "启动器会自动安装 requirements.txt。"
+    ) from exc
 
 ROOT = Path(__file__).resolve().parent
 HOME = Path(os.environ.get("TRAINER_HOME", Path.home() / "modelscope-trainer-data")).expanduser().resolve()

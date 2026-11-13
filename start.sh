@@ -93,7 +93,7 @@ if [[ ! -x "${UI_ENV_DIR}/bin/python" ]]; then
 fi
 
 ui_deps_ok() {
-  "${UI_ENV_DIR}/bin/python" -c 'import gradio, numpy, psutil, toml' >/dev/null 2>&1
+  "${UI_ENV_DIR}/bin/python" -c 'import gradio, numpy, psutil, toml, loguru' >/dev/null 2>&1
 }
 
 UI_INSTALLED_HASH="$(cat "${UI_MARKER}" 2>/dev/null || true)"
