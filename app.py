@@ -1285,7 +1285,7 @@ def _write_task_state(task: dict) -> None:
 
 def _reconcile_task_locked() -> dict | None:
     task = STATE.get("task") or _load_task_state()
-    if task and task.get("status") == "running" and not _pid_alive(task.get("pid")):
+    if task and task.get("status") in {"running", "paused"} and not _pid_alive(task.get("pid")):
         task.update(status="finished", finished_at=task.get("finished_at") or _now_text())
         _write_task_state(task)
     STATE["task"] = task
@@ -1302,11 +1302,19 @@ def _task_running(task: dict | None) -> bool:
     return bool(task and task.get("status") == "running" and _pid_alive(task.get("pid")))
 
 
+def _task_paused(task: dict | None) -> bool:
+    return bool(task and task.get("status") == "paused" and _pid_alive(task.get("pid")))
+
+
+def _task_active(task: dict | None) -> bool:
+    return _task_running(task) or _task_paused(task)
+
+
 def _task_is_running_locked() -> bool:
     proc = STATE.get("process")
     if proc and proc.poll() is None:
         return True
-    return _task_running(_reconcile_task_locked())
+    return _task_active(_reconcile_task_locked())
 
 
 def _task_label(task: dict | None) -> str:
@@ -1318,13 +1326,20 @@ def _task_label(task: dict | None) -> str:
 def _task_status_text(task: dict | None, kind: str) -> str:
     if not task:
         return "空闲"
-    running = _task_running(task)
+    active = _task_active(task)
+    paused = _task_paused(task)
     label = _task_label(task)
     if task.get("kind") != kind:
-        if running:
-            return f"其他任务运行中：{label} · PID {task.get('pid')}"
+        if active:
+            state_text = "已暂停" if paused else "运行中"
+            return f"其他任务{state_text}：{label} · PID {task.get('pid')}"
         return "空闲"
-    if running:
+    if paused:
+        return (
+            f"已暂停 · {label} · PID {task.get('pid')} · "
+            f"暂停于 {task.get('paused_at', '')} · 点击“继续”恢复"
+        )
+    if active:
         return f"运行中 · {label} · PID {task.get('pid')} · 已运行 {_elapsed_text(task.get('started_at', ''))}"
     if task.get("status") == "finished":
         exit_code = task.get("exit_code")
@@ -1341,15 +1356,24 @@ def _task_statuses(task: dict | None) -> tuple[str, str, str]:
 
 
 def _task_button_updates(task: dict | None) -> tuple:
-    running = _task_running(task)
+    active = _task_active(task)
+    paused = _task_paused(task)
     kind = task.get("kind") if task else None
+
+    def pause_button(task_kind: str):
+        enabled = active and kind == task_kind
+        return gr.update(value="继续" if paused and enabled else "暂停", interactive=enabled)
+
     return (
-        gr.update(interactive=not running),
-        gr.update(interactive=running and kind == "h3-generate"),
-        gr.update(interactive=not running),
-        gr.update(interactive=running and kind == "h3-train"),
-        gr.update(interactive=not running),
-        gr.update(interactive=running and kind == "train"),
+        gr.update(interactive=not active),
+        gr.update(interactive=active and kind == "h3-generate"),
+        pause_button("h3-generate"),
+        gr.update(interactive=not active),
+        gr.update(interactive=active and kind == "h3-train"),
+        pause_button("h3-train"),
+        gr.update(interactive=not active),
+        gr.update(interactive=active and kind == "train"),
+        pause_button("train"),
     )
 
 
@@ -1424,7 +1448,7 @@ def start_training(command: str, task_kind: str = "train", context: dict | None 
     context = context or {}
     with STATE["lock"]:
         if _task_is_running_locked():
-            raise gr.Error("已有任务正在运行，请先停止或等待结束")
+            raise gr.Error("已有任务正在运行或暂停，请先停止或等待结束")
         label = TASK_LABELS.get(task_kind, task_kind)
         logger.info("=" * 72)
         logger.info(f"任务启动 · {label} · {_now_text()}")
@@ -1459,19 +1483,53 @@ def start_general_training(command: str) -> str:
     return start_training(command, "train", {"command": command})
 
 
+def pause_or_resume_training() -> str:
+    with STATE["lock"]:
+        task = _reconcile_task_locked()
+        if not _task_active(task):
+            return "当前没有可暂停或继续的任务"
+        pid = int(task["pid"])
+        label = _task_label(task)
+        if _task_paused(task):
+            try:
+                os.killpg(pid, signal.SIGCONT)
+            except ProcessLookupError:
+                return f"PID {pid} 已退出"
+            except PermissionError:
+                return f"没有权限继续 PID {pid}"
+            task.update(status="running", resumed_at=_now_text())
+            STATE["task"] = task
+            _write_task_state(task)
+            logger.info(f"继续任务 · {label} · PID {pid}")
+            return f"已继续 · {label} · PID {pid}"
+        try:
+            os.killpg(pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            return f"PID {pid} 已退出"
+        except PermissionError:
+            return f"没有权限暂停 PID {pid}"
+        task.update(status="paused", paused_at=_now_text())
+        STATE["task"] = task
+        _write_task_state(task)
+        logger.info(f"暂停任务 · {label} · PID {pid}")
+        return f"已暂停 · {label} · PID {pid}；点击“继续”恢复"
+
+
 def stop_training() -> str:
     with STATE["lock"]:
         task = _reconcile_task_locked()
         proc = STATE.get("process")
         if proc and proc.poll() is None:
             pid = proc.pid
-        elif _task_running(task):
+        elif _task_active(task):
             pid = int(task["pid"])
         else:
             return "当前没有运行中的任务"
         label = _task_label(task)
         logger.info(f"发送停止信号 · {label} · PID {pid}")
         try:
+            if _task_paused(task):
+                os.killpg(pid, signal.SIGCONT)
             os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
             return f"PID {pid} 已退出"
@@ -1831,6 +1889,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                 auto_start = gr.Button("生成目标图", variant="primary")
                 with gr.Row():
                     auto_stop = gr.Button("停止", interactive=False)
+                    auto_pause = gr.Button("暂停", interactive=False)
                     auto_log_refresh = gr.Button("刷新日志")
                 auto_status = gr.Textbox(label="生成状态", interactive=False)
                 auto_job_dir = gr.Textbox(label="当前批次目录", interactive=False)
@@ -1896,6 +1955,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                 h3_start = gr.Button("开始 LoRA 训练", variant="primary")
                 with gr.Row():
                     h3_stop = gr.Button("停止", interactive=False)
+                    h3_pause = gr.Button("暂停", interactive=False)
                     h3_log_refresh = gr.Button("刷新日志")
                     h3_outputs_refresh = gr.Button("刷新输出")
                 h3_status = gr.Textbox(label="训练状态", interactive=False)
@@ -1980,6 +2040,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
             [auto_size, auto_size_info],
         )
         auto_stop.click(stop_training, outputs=auto_status)
+        auto_pause.click(pause_or_resume_training, outputs=auto_status)
         auto_log_timer = gr.Timer(value=2.0, active=True)
         auto_log_timer.tick(read_log, outputs=auto_log)
         auto_log_refresh.click(read_log, outputs=auto_log)
@@ -1999,6 +2060,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
             [h3_command, h3_lora_path, h3_status],
         )
         h3_stop.click(stop_training, outputs=h3_status)
+        h3_pause.click(pause_or_resume_training, outputs=h3_status)
         h3_log_timer = gr.Timer(value=2.0, active=True)
         h3_log_timer.tick(read_log, inputs=h3_log_lines, outputs=h3_log)
         h3_log_refresh.click(read_log, inputs=h3_log_lines, outputs=h3_log)
@@ -2079,6 +2141,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         with gr.Row():
             start = gr.Button("开始训练", variant="primary")
             stop = gr.Button("停止", interactive=False)
+            pause = gr.Button("暂停", interactive=False)
             update_log = gr.Button("刷新日志")
         status = gr.Textbox(label="状态")
         log = gr.Textbox(
@@ -2093,12 +2156,18 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         train_log_timer.tick(read_log, outputs=log)
         start.click(start_general_training, command, status)
         stop.click(stop_training, outputs=status)
+        pause.click(pause_or_resume_training, outputs=status)
         update_log.click(read_log, outputs=log)
 
     task_state_timer = gr.Timer(value=1.0, active=True)
     task_state_timer.tick(
         poll_task_controls,
-        outputs=[auto_status, h3_status, status, auto_start, auto_stop, h3_start, h3_stop, start, stop],
+        outputs=[
+            auto_status, h3_status, status,
+            auto_start, auto_stop, auto_pause,
+            h3_start, h3_stop, h3_pause,
+            start, stop, pause,
+        ],
     )
     demo.load(
         restore_task_ui,
@@ -2106,7 +2175,9 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
             auto_status, h3_status, status,
             auto_job_dir, auto_summary, auto_command,
             h3_dataset, h3_lora_path, h3_command, command,
-            auto_start, auto_stop, h3_start, h3_stop, start, stop,
+            auto_start, auto_stop, auto_pause,
+            h3_start, h3_stop, h3_pause,
+            start, stop, pause,
             artifact_jobs, artifact_gallery, artifact_status, artifact_outputs,
         ],
     )
