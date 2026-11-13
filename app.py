@@ -92,18 +92,22 @@ INSTALL_STATE = {"running": False, "step": "尚未开始", "returncode": None, "
 
 CUSTOM_GENERATION_SIZE = "自定义尺寸（高级）"
 COMMON_GENERATION_SIZES = (
-    (512, 512, "1:1 方形"),
-    (512, 768, "2:3 竖版"),
-    (768, 512, "3:2 横版"),
-    (640, 896, "5:7 竖版"),
-    (896, 640, "7:5 横版"),
-    (768, 768, "1:1 方形"),
-    (768, 1024, "3:4 竖版"),
-    (1024, 768, "4:3 横版"),
-    (832, 1216, "2:3 竖版"),
-    (1216, 832, "3:2 横版"),
-    (1024, 1024, "1:1 方形"),
-    (1216, 1216, "1:1 方形"),
+    (512, 512, "1:1"),
+    (512, 768, "2:3"),
+    (768, 512, "3:2"),
+    (576, 768, "3:4"),
+    (768, 576, "4:3"),
+    (768, 768, "1:1"),
+    (576, 1024, "9:16"),
+    (1024, 576, "16:9"),
+    (768, 1024, "3:4"),
+    (1024, 768, "4:3"),
+    (720, 1280, "9:16"),
+    (1280, 720, "16:9"),
+    (832, 1216, "2:3"),
+    (1216, 832, "3:2"),
+    (1024, 1024, "1:1"),
+    (1216, 1216, "1:1"),
 )
 
 
@@ -172,13 +176,13 @@ def generation_size_options() -> tuple[list[str], str, str]:
     )
     choices = []
     for width, height, aspect in eligible:
-        label = f"{width} × {height} · {aspect}"
+        label = f"{aspect} · {width} × {height}"
         if (width, height) == default_size:
             label += " · 推荐"
         choices.append(label)
     choices.append(CUSTOM_GENERATION_SIZE)
     default_choice = next(
-        (choice for choice in choices if choice.startswith(f"{default_size[0]} × {default_size[1]}")),
+        (choice for choice in choices if f"{default_size[0]} × {default_size[1]}" in choice),
         choices[0],
     )
 
@@ -199,7 +203,7 @@ def generation_size_options() -> tuple[list[str], str, str]:
 
 def resolve_generation_size(size_choice: str, width: int, height: int) -> tuple[int, int]:
     if size_choice != CUSTOM_GENERATION_SIZE:
-        match = re.match(r"(\d+)\s*×\s*(\d+)", size_choice or "")
+        match = re.search(r"(\d+)\s*×\s*(\d+)", size_choice or "")
         if match:
             return int(match.group(1)), int(match.group(2))
     width, height = int(width or 0), int(height or 0)
