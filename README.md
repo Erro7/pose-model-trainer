@@ -21,11 +21,19 @@ modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04
 - H3 使用 `entropack[cuda13]`
 - 不再推荐旧的 torch 2.0 / CUDA 11.7 WebUI 镜像
 
-### AMD ROCm 不支持 H3
+### AMD ROCm：H3 不支持，Wan 视频实验支持
 
 `ubuntu22.04-rocm7.2.3-py312-torch2.12.0-1.40.1` 不能运行本项目的 H3 工作流。H3 EntroPack 只提供 `entropack[cuda12]` / `entropack[cuda13]` 扩展，启动时强制检查 `torch.version.cuda` 与 `torch.cuda`；AMD ROCm 提供的 `torch.version.hip` 不会被当成 CUDA 使用。
 
-一键安装和启动脚本会检查镜像名、`torch.version.hip`、`rocm-smi`、`ROCM_PATH`、`HIP_PATH` 与 `/opt/rocm`。如果检测到 ROCm 且没有 `nvidia-smi`，会在安装 Python 环境或下载模型之前停止，并直接提示该 ROCm 镜像不支持。请改用推荐的 NVIDIA 镜像：
+MiniMax-H3 家族另有一支视频模型（FL2VA / Ref2VA，输出视频与原生音频），上游 DiffSynth-Studio 已提供示例和 LoRA 训练脚本；但本项目尚未把 H3 视频接入一键流程，也没有可在当前 ROCm 镜像上验证的 H3 视频量化/训练路径，因此不会把“上游存在模型”误报成“AMD 可用”。
+
+| 工作流 | NVIDIA CUDA 12.8+ | AMD ROCm |
+|---|---|---|
+| H3-Image + EntroPack（本项目一键 H3 流程） | 支持 | 不支持 |
+| H3 视频 FL2VA / Ref2VA（上游 DiffSynth） | 上游可用，本项目未接入 | 不支持 / 未验证 |
+| Wan 2.1 / 2.2 视频 LoRA（本项目训练页） | 支持 | 实验支持 |
+
+一键安装和启动脚本会检查镜像名、`torch.version.hip`、`rocm-smi`、`ROCM_PATH`、`HIP_PATH` 与 `/opt/rocm`。检测到 ROCm 且没有 `nvidia-smi` 时仍会启动 WebUI，但 H3 生成、H3 环境准备和 H3 训练入口会直接禁用；Wan 视频训练会自动关闭 FP8、T5 FP8、cuDNN 加速和 `adamw8bit`，改用 bf16 + AdamW。该 ROCm 路径属于实验支持，建议先用小分辨率、少帧数验证。要使用 H3，请切换到推荐的 NVIDIA 镜像：
 
 ```text
 modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04
@@ -35,10 +43,11 @@ modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04
 
 启动前会自动执行环境预检：
 
-- Python 3.10 以下、AMD ROCm 或没有 NVIDIA GPU：停止，不下载模型，并显示推荐镜像。
+- Python 3.10 以下或没有可用 GPU：停止，不下载模型，并显示推荐镜像。
 - 驱动 CUDA 13.0+：选择 `cu130` 配置继续。
 - 驱动 CUDA 12.8–12.x：提示推荐环境，选择 `cu128` 兼容配置继续。
 - 驱动 CUDA 低于 12.8：停止并推荐更换容器。
+- AMD ROCm：启动 WebUI，禁用 H3，保留 Wan 视频实验路径。
 - 检查通过后才更新仓库、构建环境和下载模型。
 
 
@@ -90,6 +99,7 @@ TRAINER_MODEL_BUDGET_GB=80
 
 - 图片：SDXL、FLUX.1（基于 `kohya-ss/sd-scripts`）
 - 视频：Wan 2.1 / 2.2（基于 `kohya-ss/musubi-tuner`）
+- AMD ROCm：Wan 视频实验路径；H3 Image 与 H3 视频均禁用
 - ModelScope 模型 ID 下载、已有本地权重路径
 - 按需同步 `anhao/ai-pose-gallery-zh`，筛选姿势并生成图片/描述训练集
 - MiniMax-H3-Image 人物 + 服装 + Pose 多参考编辑 LoRA，两阶段缓存与训练
@@ -203,7 +213,7 @@ dataset/videos/001.mp4
 dataset/videos/001.txt
 ```
 
-视频会按设定的分辨率与帧数缓存。24GB 显存建议先从 `512×288 / 49 帧 / batch 1` 开始；Wan 14B 仍可能受系统内存和具体模型影响。
+视频会按设定的分辨率与帧数缓存。24GB 显存建议先从 `512×288 / 49 帧 / batch 1` 开始；Wan 14B 仍可能受系统内存和具体模型影响。AMD ROCm 下请先使用 Wan 2.1 T2V 1.3B，并保持小分辨率、少帧数；当前实验路径使用 bf16、AdamW 和 `--disable_cudnn_backend`，不启用 FP8。
 
 FLUX 需要分别指定主模型、CLIP-L、T5XXL、AE；Wan 需要分别指定 DiT、VAE、UMT5。页面会校验这些路径。
 

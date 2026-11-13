@@ -45,6 +45,7 @@ export PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
 export PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-mirrors.aliyun.com}"
 export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-120}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
 unset GRADIO_ROOT_PATH
 
 log_info "PyPI source: ${PIP_INDEX_URL}"
@@ -73,23 +74,32 @@ if [[ -n "${TRAINER_BASE_IMAGE:-}" && "${TRAINER_BASE_IMAGE,,}" == *rocm* ]]; th
   ROCM_IMAGE=1
 fi
 
+ROCM_ONLY=0
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   if [[ -n "${ROCM_INFO}" || "${ROCM_IMAGE}" == "1" ]]; then
-    log_error "preflight: AMD ROCm runtime detected: ${ROCM_INFO:-ROCm image detected}"
-    log_error "preflight: H3 EntroPack requires NVIDIA CUDA 12.8+; AMD ROCm is not supported"
-    log_error "preflight: ROCm image ubuntu22.04-rocm7.2.3-py312-torch2.12.0-1.40.1 cannot run H3 EntroPack"
-    log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
+    ROCM_ONLY=1
+    export TRAINER_GPU_VENDOR="rocm"
+    export TRAINER_ROCM_INFO="${ROCM_INFO:-ROCm image detected}"
+    export TRAINER_RUNTIME_PROFILE="rocm"
+    log_warn "preflight: AMD ROCm runtime detected: ${TRAINER_ROCM_INFO}"
+    log_warn "preflight: H3 Image EntroPack and H3 video are disabled on AMD ROCm"
+    log_warn "preflight: Wan 2.1 / 2.2 video training is available as an experimental ROCm path"
+  else
+    log_error "preflight: NVIDIA GPU is not visible and AMD ROCm was not detected"
+    log_error "preflight: create an NVIDIA CUDA GPU Notebook with: ${RECOMMENDED_IMAGE}"
     exit 1
   fi
-  log_error "preflight: NVIDIA GPU is not visible and AMD ROCm was not detected"
-  log_error "preflight: create an NVIDIA CUDA GPU Notebook with: ${RECOMMENDED_IMAGE}"
-  exit 1
-fi
-if [[ -n "${ROCM_INFO}" ]]; then
-  log_warn "preflight: AMD ROCm also detected (${ROCM_INFO}); NVIDIA CUDA will be used"
+else
+  export TRAINER_GPU_VENDOR="nvidia"
+  if [[ "${TRAINER_RUNTIME_PROFILE:-}" == "rocm" ]]; then
+    unset TRAINER_RUNTIME_PROFILE
+  fi
+  if [[ -n "${ROCM_INFO}" ]]; then
+    log_warn "preflight: AMD ROCm also detected (${ROCM_INFO}); NVIDIA CUDA will be used"
+  fi
 fi
 
-if [[ -z "${TRAINER_RUNTIME_PROFILE:-}" ]]; then
+if [[ "${ROCM_ONLY}" == "0" && -z "${TRAINER_RUNTIME_PROFILE:-}" ]]; then
   CUDA_MAX="$(nvidia-smi 2>&1 | sed -n 's/.*CUDA Version: \([0-9][0-9.]*\).*/\1/p' | head -n1)"
   if [[ -z "${CUDA_MAX}" ]]; then
     log_error "preflight: cannot determine the driver CUDA capability"
@@ -107,14 +117,26 @@ if [[ -z "${TRAINER_RUNTIME_PROFILE:-}" ]]; then
   fi
 fi
 if [[ -z "${TRAINER_BASE_IMAGE:-}" ]]; then
-  if [[ "${TRAINER_RUNTIME_PROFILE}" == "cu130" ]]; then
+  if [[ "${ROCM_ONLY}" == "1" ]]; then
+    export TRAINER_BASE_IMAGE="detected:rocm"
+  elif [[ "${TRAINER_RUNTIME_PROFILE}" == "cu130" ]]; then
     export TRAINER_BASE_IMAGE="${RECOMMENDED_IMAGE}"
   else
     export TRAINER_BASE_IMAGE="detected:${TRAINER_RUNTIME_PROFILE}"
   fi
 fi
-log_info "preflight: selected H3 profile: ${TRAINER_RUNTIME_PROFILE}"
+log_info "preflight: runtime profile: ${TRAINER_RUNTIME_PROFILE}"
+log_info "preflight: GPU vendor: ${TRAINER_GPU_VENDOR}"
 log_info "preflight: system torch: ${SYSTEM_TORCH} (cuda=${SYSTEM_CUDA:-none}, hip=${SYSTEM_HIP:-none})"
+if [[ "${ROCM_ONLY}" == "1" ]]; then
+  log_info "preflight: video backend: Wan 2.1 / 2.2 (ROCm experimental); H3 disabled"
+else
+  log_info "preflight: video backend: Wan 2.1 / 2.2 + H3 (NVIDIA CUDA)"
+fi
+if [[ "${TRAINER_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  log_info "preflight: check complete"
+  exit 0
+fi
 
 HOST_PYTHON_TAG="$(python3 -c 'import sys; print(f"py{sys.version_info.major}{sys.version_info.minor}")')"
 REQUIREMENTS_HASH="$(sha256sum "${ROOT_DIR}/requirements.txt" | awk '{print $1}')"

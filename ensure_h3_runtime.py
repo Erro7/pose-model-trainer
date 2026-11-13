@@ -25,7 +25,14 @@ BASE_IMAGE = os.environ.get(
 
 RUNTIME_PROFILE = os.environ.get("TRAINER_RUNTIME_PROFILE", "").lower()
 
-if RUNTIME_PROFILE == "cu130" or (not RUNTIME_PROFILE and "cu130" in BASE_IMAGE.lower()):
+if RUNTIME_PROFILE == "rocm" or (not RUNTIME_PROFILE and "rocm" in BASE_IMAGE.lower()):
+    PROFILE = "rocm"
+    DEFAULT_TORCH = ""
+    DEFAULT_TORCHVISION = ""
+    DEFAULT_INDEX = ""
+    ENTROPACK_EXTRA = ""
+    EXPECTED_CUDA = ""
+elif RUNTIME_PROFILE == "cu130" or (not RUNTIME_PROFILE and "cu130" in BASE_IMAGE.lower()):
     PROFILE = "cu130"
     DEFAULT_TORCH = "2.13.0"
     DEFAULT_TORCHVISION = "0.28.0"
@@ -105,9 +112,9 @@ def gpu_support_error(rocm_info: str, nvidia_visible: bool) -> str | None:
         return None
     if rocm_info:
         return (
-            "H3 EntroPack requires NVIDIA CUDA 12.8+; AMD ROCm is not supported. "
+            "The H3 workflow is not supported on AMD ROCm. "
+            "H3-Image EntroPack is NVIDIA CUDA-only, and H3 video FL2VA/Ref2VA is not integrated in this launcher. "
             f"Detected: {rocm_info}. "
-            "Image ubuntu22.04-rocm7.2.3-py312-torch2.12.0-1.40.1 cannot run H3 EntroPack. "
             f"Use an NVIDIA CUDA GPU Notebook with {RECOMMENDED_IMAGE}."
         )
     return (

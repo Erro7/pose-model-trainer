@@ -49,6 +49,7 @@ BASE_IMAGE = os.environ.get(
     RECOMMENDED_IMAGE,
 )
 RUNTIME_PROFILE = os.environ.get("TRAINER_RUNTIME_PROFILE", "cu130")
+GPU_VENDOR = os.environ.get("TRAINER_GPU_VENDOR", "").strip().lower()
 for folder in (REPOS, MODELS, CONFIGS, OUTPUTS, LOGS, DATASETS):
     folder.mkdir(parents=True, exist_ok=True)
 LATEST_LOG = LOGS / "latest.log"
@@ -146,15 +147,26 @@ def detect_rocm_runtime() -> str:
     return "；".join(dict.fromkeys(markers))
 
 
-ROCM_INFO = detect_rocm_runtime()
+ROCM_INFO = os.environ.get("TRAINER_ROCM_INFO", "").strip() or detect_rocm_runtime()
+
+
+def rocm_video_mode() -> bool:
+    return GPU_VENDOR == "rocm" or (bool(ROCM_INFO) and shutil.which("nvidia-smi") is None)
+
+
+def video_support_info() -> str:
+    if rocm_video_mode():
+        return "Wan 2.1 / 2.2（AMD ROCm 实验路径，关闭 FP8/cuDNN 加速）；H3 视频未接入"
+    return "Wan 2.1 / 2.2（NVIDIA CUDA）；H3 视频 FL2VA/Ref2VA 未接入本启动器"
 
 
 def h3_gpu_support_error() -> str | None:
-    if shutil.which("nvidia-smi"):
+    if GPU_VENDOR != "rocm" and shutil.which("nvidia-smi"):
         return None
     if ROCM_INFO:
         return (
-            f"AMD ROCm（{ROCM_INFO}）不受支持；H3 EntroPack 需要 NVIDIA CUDA 12.8+。"
+            f"AMD ROCm（{ROCM_INFO}）不能运行 H3 Image EntroPack，H3 视频也未接入本启动器。"
+            "可在“训练”页使用 Wan 2.1 / 2.2 视频 LoRA（AMD ROCm 实验路径）。"
             f"请改用 {RECOMMENDED_IMAGE}。"
         )
     return f"未检测到 NVIDIA GPU 或 AMD ROCm；请改用 {RECOMMENDED_IMAGE}。"
@@ -339,14 +351,26 @@ def system_info() -> str:
     except FileNotFoundError:
         gpu = ""
     if not gpu and ROCM_INFO:
-        gpu = f"AMD ROCm（{ROCM_INFO}）；H3 EntroPack 不支持，需要 NVIDIA CUDA 12.8+"
+        gpu = f"AMD ROCm（{ROCM_INFO}）；H3 禁用，Wan 视频为实验支持"
     elif gpu and ROCM_INFO:
         gpu = f"{gpu}；同时检测到 AMD ROCm（{ROCM_INFO}），H3 将使用 NVIDIA CUDA"
     else:
         gpu = gpu or "未检测到 NVIDIA GPU"
     disk = psutil.disk_usage(str(HOME))
     venv = "是" if sys.prefix != sys.base_prefix else "否"
-    return f"宿主镜像: {BASE_IMAGE}\n推荐 H3 镜像: {RECOMMENDED_IMAGE}\nH3 运行配置: {RUNTIME_PROFILE}\nWebUI Python: {sys.executable}\nH3 任务 Python: {task_python_path()}\nWebUI 虚拟环境: {venv}\nGPU: {gpu}\nRAM: {psutil.virtual_memory().total / 2**30:.1f} GiB\n可用磁盘: {disk.free / 2**30:.1f} GiB\n工作目录: {HOME}"
+    return (
+        f"宿主镜像: {BASE_IMAGE}\n"
+        f"推荐 H3 镜像: {RECOMMENDED_IMAGE}\n"
+        f"H3 运行配置: {RUNTIME_PROFILE}\n"
+        f"WebUI Python: {sys.executable}\n"
+        f"H3 任务 Python: {task_python_path()}\n"
+        f"WebUI 虚拟环境: {venv}\n"
+        f"GPU: {gpu}\n"
+        f"视频训练: {video_support_info()}\n"
+        f"RAM: {psutil.virtual_memory().total / 2**30:.1f} GiB\n"
+        f"可用磁盘: {disk.free / 2**30:.1f} GiB\n"
+        f"工作目录: {HOME}"
+    )
 
 
 def run_visible(command: str) -> str:
@@ -627,6 +651,8 @@ def health_check() -> str:
     gpu_error = h3_gpu_support_error()
     lines.append(f"{missing if gpu_error else passed} H3 GPU：{gpu_error or 'NVIDIA CUDA'}")
     blocked = blocked or bool(gpu_error)
+    video_detail = video_support_info()
+    lines.append(f"{warning if rocm_video_mode() else passed} 视频训练：{video_detail}")
 
     writable = HOME.is_dir() and os.access(HOME, os.W_OK)
     lines.append(f"{passed if writable else missing} 持久目录：{HOME}")
@@ -697,7 +723,9 @@ def health_check() -> str:
         f"{passed if loras else warning} LoRA 输出：{loras} 个",
     ])
 
-    if gpu_error:
+    if gpu_error and rocm_video_mode():
+        next_step = "H3 不可用；可在“训练”页使用 Wan 2.1 / 2.2 视频 LoRA（AMD ROCm 实验路径）。"
+    elif gpu_error:
         next_step = gpu_error
     elif blocked:
         next_step = "先修复上方标记为“缺失”的环境项目。"
@@ -1137,13 +1165,15 @@ def build_command(task, data_dir, model_path, component1, component2, component3
     if not model.exists():
         raise gr.Error(f"模型路径不存在：{model}")
     image = task in ("SDXL LoRA", "FLUX.1 LoRA")
+    rocm_video = not image and rocm_video_mode()
     dataset = write_dataset_config("image" if image else "video", data_dir, width, height, frames, repeats)
     output = OUTPUTS / output_name.strip()
     output.mkdir(parents=True, exist_ok=True)
+    optimizer = "adamw" if rocm_video else "adamw8bit"
     common = (
         f"--dataset_config {q(dataset)} --output_dir {q(output)} --output_name {q(output_name.strip())} "
         f"--mixed_precision bf16 --save_precision bf16 --gradient_checkpointing "
-        f"--optimizer_type adamw8bit --learning_rate {float(lr)} --network_dim {int(rank)} "
+        f"--optimizer_type {optimizer} --learning_rate {float(lr)} --network_dim {int(rank)} "
         f"--max_train_epochs {int(epochs)} --save_every_n_epochs 1 --seed 42"
     )
     if task == "SDXL LoRA":
@@ -1161,8 +1191,13 @@ def build_command(task, data_dir, model_path, component1, component2, component3
         base = REPOS / "musubi-tuner/src/musubi_tuner"
         wan_task = {"Wan 2.1 T2V 1.3B LoRA": "t2v-1.3B", "Wan 2.1 T2V 14B LoRA": "t2v-14B", "Wan 2.2 T2V A14B LoRA": "t2v-A14B"}[task]
         cache_latents = f"{py()} {q(base / 'wan_cache_latents.py')} --dataset_config {q(dataset)} --vae {q(vae)} --vae_cache_cpu"
-        cache_text = f"{py()} {q(base / 'wan_cache_text_encoder_outputs.py')} --dataset_config {q(dataset)} --t5 {q(t5)} --batch_size 1 --fp8_t5"
-        train = f"{accelerate()} --num_cpu_threads_per_process 1 --mixed_precision bf16 {q(base / 'wan_train_network.py')} --task {wan_task} --dit {q(model)} --network_module networks.lora_wan {common} --sdpa --fp8_base --blocks_to_swap 20"
+        cache_text = f"{py()} {q(base / 'wan_cache_text_encoder_outputs.py')} --dataset_config {q(dataset)} --t5 {q(t5)} --batch_size 1"
+        train = f"{accelerate()} --num_cpu_threads_per_process 1 --mixed_precision bf16 {q(base / 'wan_train_network.py')} --task {wan_task} --dit {q(model)} --network_module networks.lora_wan {common} --sdpa --blocks_to_swap 20"
+        if rocm_video:
+            cache_latents += " --disable_cudnn_backend"
+        else:
+            cache_text += " --fp8_t5"
+            train += " --fp8_base"
         cmd = f"{cache_latents} && {cache_text} && {train}"
     if extra.strip():
         cmd += " " + extra.strip()
@@ -1453,7 +1488,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         )
         gr.Markdown(
             f"**宿主基线：** `{BASE_IMAGE}` ；H3 使用独立持久环境，不修改镜像自带 torch 2.0/cu117。\\n\\n"
-            "**GPU 要求：** NVIDIA CUDA 12.8+；AMD ROCm 镜像不能运行 H3 EntroPack。\\n\\n"
+            "**GPU 要求：** NVIDIA CUDA 12.8+ 支持 H3 与 Wan 视频；AMD ROCm 禁用 H3，仅提供 Wan 视频实验路径。\\n\\n"
             "**固定策略：模型最多 80GB，生成数据与 LoRA 输出至少预留 20GB。** "
             "H3 会自动复用缓存；达到模型上限后停止新增下载。"
         )
@@ -1707,6 +1742,9 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         )
     with gr.Tab("训练"):
         task = gr.Dropdown(["SDXL LoRA", "FLUX.1 LoRA", "Wan 2.1 T2V 1.3B LoRA", "Wan 2.1 T2V 14B LoRA", "Wan 2.2 T2V A14B LoRA"], value="Wan 2.1 T2V 1.3B LoRA", label="任务")
+        gr.Markdown(
+            f"视频支持：{video_support_info()}。AMD ROCm 自动使用 bf16 + AdamW，关闭 FP8、T5 FP8 和 cuDNN 加速。"
+        )
         with gr.Row():
             data_dir = gr.Textbox(label="训练数据目录")
             model_path = gr.Textbox(label="模型或 DiT 权重路径")
