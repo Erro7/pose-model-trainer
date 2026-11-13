@@ -173,6 +173,13 @@ H3 没有独立“模型”页。点击“生成目标图”或“开始 LoRA �
 
 顶层只保留 `${TRAINER_HOME}/models`。ModelScope 内部元数据缓存在 `models/.modelscope-cache`；旧版本使用过的顶层 `${TRAINER_HOME}/modelscope-cache` 会由 `--clean` 一次性迁移并删除。
 
+模型下载完成后会写入 `models/.h3-download-receipts.json`。后续任务只校验本地文件是否完整，命中缓存时不会连接 ModelScope，也不会再显示 “Downloading … files”。需要重新检查远端模型更新时执行：
+
+```bash
+.venv-h3/bin/python download_h3.py --profile quantized \
+  --models-dir "${TRAINER_HOME:-/mnt/workspace/pose-model-trainer-data}/models" --refresh
+```
+
 首轮验证默认值：
 
 | 参数 | 默认值 |
