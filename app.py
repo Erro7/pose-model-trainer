@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("DO_NOT_TRACK", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import re
 import random
 import shlex
@@ -19,9 +25,6 @@ import gradio as gr
 from loguru import logger
 import psutil
 import toml
-
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 
 ROOT = Path(__file__).resolve().parent
 HOME = Path(os.environ.get("TRAINER_HOME", Path.home() / "modelscope-trainer-data")).expanduser().resolve()
@@ -148,11 +151,16 @@ def storage_info() -> str:
 
 
 def system_info() -> str:
-    gpu = subprocess.run(
-        ["bash", "-lc", "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null || true"],
-        capture_output=True,
-        text=True,
-    ).stdout.strip() or "未检测到 NVIDIA GPU"
+    try:
+        gpu_result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+        )
+        gpu = gpu_result.stdout.strip()
+    except FileNotFoundError:
+        gpu = ""
+    gpu = gpu or "未检测到 NVIDIA GPU"
     disk = psutil.disk_usage(str(HOME))
     venv = "是" if sys.prefix != sys.base_prefix else "否"
     return f"宿主镜像: {BASE_IMAGE}\nH3 运行配置: {RUNTIME_PROFILE}\nWebUI Python: {sys.executable}\nH3 任务 Python: {task_python_path()}\nWebUI 虚拟环境: {venv}\nGPU: {gpu}\nRAM: {psutil.virtual_memory().total / 2**30:.1f} GiB\n可用磁盘: {disk.free / 2**30:.1f} GiB\n工作目录: {HOME}"
@@ -500,11 +508,11 @@ def health_check() -> str:
     if blocked:
         next_step = "先修复上方标记为“缺失”的环境项目。"
     elif not candidates:
-        next_step = "环境可用。下一步：H3 工作流 → 1 · 生成目标图。"
+        next_step = "H3 工作流 → 1 · 生成目标图。"
     elif not finalized:
-        next_step = "下一步：H3 工作流 → 2 · 筛选整理。"
+        next_step = "H3 工作流 → 2 · 筛选整理。"
     elif not loras:
-        next_step = "下一步：H3 工作流 → 3 · 训练 LoRA。"
+        next_step = "H3 工作流 → 3 · 训练 LoRA。"
     else:
         next_step = "环境和完整流程均已就绪，可继续生成或训练新批次。"
     overall = "阻塞" if blocked else "可用"
@@ -1033,7 +1041,7 @@ def list_lora_outputs(output_dir: str):
     return [str(path) for path in sorted(root.rglob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)]
 
 
-with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
+with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo:
     gr.Markdown("# 魔搭 Notebook · 图片 / 视频 LoRA 快速训练器\n24GB 单卡默认配置；先安装环境，再选择数据与权重。")
     with gr.Tab("首页"):
         gr.Markdown("## 统一环境检查")
