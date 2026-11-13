@@ -8,6 +8,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 HOME = Path(os.environ.get("TRAINER_HOME", "/mnt/workspace/pose-model-trainer-data")).expanduser().resolve()
 DIFFSYNTH = HOME / "repos" / "DiffSynth-Studio"
 REQUIRED = ("torch", "torchvision", "diffsynth", "entropack", "cupy", "accelerate")
@@ -38,9 +43,13 @@ TORCHVISION_VERSION = os.environ.get("H3_TORCHVISION_VERSION", DEFAULT_TORCHVISI
 TORCH_INDEX = os.environ.get("H3_TORCH_INDEX", DEFAULT_INDEX)
 PYPI_INDEX = os.environ.get(
     "PIP_INDEX_URL",
-    "https://mirrors.cloud.aliyuncs.com/pypi/simple",
+    "https://mirrors.aliyun.com/pypi/simple",
 )
 PROFILE_MARKER = Path(sys.prefix) / f".h3-runtime-{PROFILE}-torch{TORCH_VERSION}"
+LOCK_FILE = HOME / "logs" / "h3-runtime.lock"
+PIP_CACHE_DIR = Path(
+    os.environ.get("TRAINER_PIP_CACHE_DIR", str(HOME / "pip-cache"))
+).expanduser().resolve()
 
 CUDA_CHECK = f"""
 import torch
@@ -61,9 +70,18 @@ def missing_modules() -> list[str]:
     return [name for name in REQUIRED if importlib.util.find_spec(name) is None]
 
 
-def run(command: list[str]) -> None:
+def run(command: list[str], env: dict[str, str] | None = None) -> None:
     print("[runtime] $ " + " ".join(command), flush=True)
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=env)
+
+
+def pip_env() -> dict[str, str]:
+    PIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.setdefault("PIP_CACHE_DIR", str(PIP_CACHE_DIR))
+    env.setdefault("PIP_DEFAULT_TIMEOUT", "120")
+    env.setdefault("PIP_RETRIES", "5")
+    return env
 
 
 def cuda_status() -> tuple[bool, str]:
@@ -75,6 +93,21 @@ def cuda_status() -> tuple[bool, str]:
     return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
 
 
+def acquire_lock():
+    if fcntl is None:
+        return None
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_FILE.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise SystemExit("[runtime] another H3 runtime setup is already running")
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 def install_compatible_torch() -> None:
     print(
         f"[runtime] installing {PROFILE}: "
@@ -83,11 +116,12 @@ def install_compatible_torch() -> None:
     )
     run([
         sys.executable, "-m", "pip", "install",
-        "--no-cache-dir", "--force-reinstall", "--progress-bar", "raw",
+        "--cache-dir", str(PIP_CACHE_DIR), "--force-reinstall",
+        "--progress-bar", "raw", "--retries", "5", "--timeout", "120",
         f"torch=={TORCH_VERSION}", f"torchvision=={TORCHVISION_VERSION}",
         "--index-url", TORCH_INDEX,
         "--extra-index-url", PYPI_INDEX,
-    ])
+    ], env=pip_env())
 
 
 def main() -> None:
@@ -96,12 +130,17 @@ def main() -> None:
     print(f"[runtime] python={sys.executable}", flush=True)
     print(f"[runtime] pypi_index={PYPI_INDEX}", flush=True)
     print(f"[runtime] torch_index={TORCH_INDEX}", flush=True)
+    print(f"[runtime] pip_cache={PIP_CACHE_DIR}", flush=True)
     print(f"[runtime] prefix={sys.prefix} base_prefix={sys.base_prefix}", flush=True)
     if sys.prefix == sys.base_prefix:
         raise SystemExit(
             "H3 runtime must run inside the project virtual environment; "
             f"received {sys.executable}"
         )
+
+    lock = acquire_lock()
+    if lock is not None:
+        print("[runtime] acquired setup lock", flush=True)
 
     cuda_ok, cuda_output = cuda_status()
     if cuda_output:
@@ -131,11 +170,12 @@ def main() -> None:
             ])
         run([
             sys.executable, "-m", "pip", "install",
-            "--no-cache-dir", "--progress-bar", "raw",
-            "numpy>=1.26,<2", "opencv-python<4.12",
+            "--cache-dir", str(PIP_CACHE_DIR), "--progress-bar", "raw",
+            "--retries", "5", "--timeout", "120",
+            "numpy>=2.0,<2.6", "opencv-python<4.12",
             f"entropack[{ENTROPACK_EXTRA}]>=0.1.7",
             str(DIFFSYNTH), "bitsandbytes", "accelerate",
-        ])
+        ], env=pip_env())
 
     remaining = missing_modules()
     if remaining:

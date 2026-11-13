@@ -34,13 +34,13 @@ modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04
 
 ## 一键启动
 
-安装器默认使用魔搭 DSW 的阿里云内网 PyPI 镜像：
+安装器默认使用阿里云 PyPI 镜像：
 
 ```text
-https://mirrors.cloud.aliyuncs.com/pypi/simple
+https://mirrors.aliyun.com/pypi/simple
 ```
 
-普通 Python 依赖走内网镜像；PyTorch CUDA wheel 仍从对应的 PyTorch 官方专用源获取，并把阿里内网源作为补充依赖源。可通过 `PIP_INDEX_URL` 和 `H3_TORCH_INDEX` 覆盖。
+普通 Python 依赖走该镜像；PyTorch CUDA wheel 仍从对应的 PyTorch 官方专用源获取，并把阿里云源作为补充依赖源。DSW 内网环境仍可通过 `PIP_INDEX_URL` 覆盖为内网镜像，`H3_TORCH_INDEX` 可覆盖 PyTorch 源。
 
 在推荐容器的终端中运行：
 
@@ -100,10 +100,35 @@ cd modelscope-trainer
 bash start.sh
 ```
 
+`start.sh` 会自行检查驱动 CUDA 版本并选择 `cu130` 或 `cu128`；已有 WebUI 依赖满足要求时不会重复联网安装。
+
 4. 打开输出的 Gradio 链接。
 5. 进入“首页”点击“检查完整环境与流程”。H3 依赖与模型均在首次任务中按需安装/下载，无需使用独立模型下载页。
 6. 如需姿势资源，在“姿势图库”页同步资源，生成数据集后把返回路径填入“训练数据目录”。
 7. H3 使用分步工作流：`1 · 生成目标图 → 2 · 筛选整理 → 3 · 训练 LoRA`。人物、服装和 Pose 默认都可从三合一图库选择；自定义上传放在高级区域。首次任务自动准备环境和权重，之后复用持久缓存。
+
+## 清理与强制启动
+
+`start.sh` 支持强制重启：
+
+```bash
+bash start.sh --force
+```
+
+`--force` 会先停止当前 WebUI、H3 环境安装和其他训练进程，清理残留 PID/锁文件，然后启动新进程。需要同时删除旧版 `modelscope-cache` 时使用：
+
+```bash
+bash start.sh --clean
+```
+
+`--clean` 会先停止旧进程，把旧版 `${TRAINER_HOME}/modelscope-cache` 中缺失的 H3 文件迁移到 `${TRAINER_HOME}/models`，确认量化权重完整后再删除旧缓存。也可以单独运行清理脚本，默认只做 dry-run：
+
+```bash
+bash cleanup.sh
+bash cleanup.sh --yes --stop-processes --legacy-cache
+```
+
+`bootstrap.sh` 会透传相同参数，因此远程一键安装也可以使用 `--force` 或 `--clean`。
 
 ## H3 默认模型与参数
 
@@ -115,11 +140,13 @@ H3 没有独立“模型”页。点击“生成目标图”或“开始 LoRA �
 | 文本编码器 | `DiffSynth-Studio/EntroPackPreQuants` | `models/MiniMax-H3/text_encoder_4bpp.safetensors`、对应 JSON |
 | 输出头 / Processor | `MiniMax/MiniMax-H3-Image` | `pdd_fused_heads.safetensors`、`processor/` |
 
-默认缓存目录：`${TRAINER_HOME}/modelscope-cache`。魔搭一键启动时通常为：
+默认模型目录：`${TRAINER_HOME}/models`。H3 预下载与 DiffSynth 训练共用这一目录，避免同一权重保存两份。魔搭一键启动时通常为：
 
 ```text
-/mnt/workspace/pose-model-trainer-data/modelscope-cache
+/mnt/workspace/pose-model-trainer-data/models
 ```
+
+顶层只保留 `${TRAINER_HOME}/models`。ModelScope 内部元数据缓存在 `models/.modelscope-cache`；旧版本使用过的顶层 `${TRAINER_HOME}/modelscope-cache` 会由 `--clean` 一次性迁移并删除。
 
 首轮验证默认值：
 
@@ -169,7 +196,7 @@ FLUX 需要分别指定主模型、CLIP-L、T5XXL、AE；Wan 需要分别指定 
 
 - 模型许可证和数据授权由使用者确认。
 - `ai-pose-gallery-zh` 的 MIT 许可仅覆盖代码，不覆盖图库图片与原始数据；启动器不会把第三方资源打包进本仓库。
-- 默认量化配置只自动下载训练所需的几个文件，使用 DiffSynth 官方 EntroPack LoRA 配方，控制在 80GB 以内。模型不会打包进 GitHub 仓库；首次训练下载到 `${TRAINER_HOME}/modelscope-cache`，支持断点和缓存复用。原始 BF16 模式约 130GB，作为高级选项保留。
+- 默认量化配置只自动下载训练所需的几个文件，使用 DiffSynth 官方 EntroPack LoRA 配方，控制在 80GB 以内。模型不会打包进 GitHub 仓库；首次训练下载到 `${TRAINER_HOME}/models`，支持断点和缓存复用。原始 BF16 模式约 130GB，作为高级选项保留。
 - 24GB GPU 建议保持“低显存 CPU Offload”开启；训练速度取决于系统内存、磁盘和 PCIe 传输速度。
 - 三合一任务属于监督式编辑 LoRA：目标成品图是期望输出，人物/服装/Pose 是参考输入；仅有参考图无法训练出正确映射。
 - 第一次安装与下载可能耗时较久；Notebook 重启后，只要数据盘保留，无需重新下载。

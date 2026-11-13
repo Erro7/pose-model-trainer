@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "Usage: bash bootstrap.sh [--force] [--clean]"
+  exit 0
+fi
+
 WORKSPACE="${MODELSCOPE_WORKSPACE:-/mnt/workspace}"
 REPO_DIR="${WORKSPACE}/pose-model-trainer"
 RECOMMENDED_IMAGE="modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04"
@@ -100,4 +105,4 @@ if pgrep -f "${REPO_DIR}/app.py" >/dev/null 2>&1; then
   done
 fi
 
-exec bash "${REPO_DIR}/start.sh"
+exec bash "${REPO_DIR}/start.sh" "$@"

@@ -37,6 +37,8 @@ BASE_IMAGE = os.environ.get(
 RUNTIME_PROFILE = os.environ.get("TRAINER_RUNTIME_PROFILE", "cu130")
 for folder in (REPOS, MODELS, CONFIGS, OUTPUTS, LOGS, DATASETS):
     folder.mkdir(parents=True, exist_ok=True)
+LATEST_LOG = LOGS / "latest.log"
+LATEST_LOG.touch(exist_ok=True)
 
 STATE = {"process": None, "log": None, "lock": threading.Lock()}
 INSTALL_LOG = LOGS / "install-backends.log"
@@ -84,7 +86,7 @@ def _tree_bytes(paths: list[Path]) -> int:
 
 def storage_info() -> str:
     gib = 2 ** 30
-    model_bytes = _tree_bytes([HOME / "modelscope-cache", MODELS])
+    model_bytes = _tree_bytes([MODELS])
     total_bytes = _tree_bytes([HOME])
     data_bytes = max(0, total_bytes - model_bytes)
     model_gb = model_bytes / gib
@@ -166,7 +168,7 @@ def install_backends():
         ("4/7 安装 sd-scripts 依赖", f"cd {q(sd)} && {py()} -m pip install --progress-bar off -r requirements.txt"),
         ("5/7 安装 musubi-tuner", f"{py()} -m pip install --progress-bar off -e {q(musubi)}"),
         ("6/7 安装 DiffSynth-Studio", f"{py()} -m pip install --progress-bar off {q(diffsynth)}"),
-        ("7/7 修复并验证运行依赖", f"{py()} -m pip install --progress-bar off 'numpy>=1.26,<2' 'opencv-python<4.12' bitsandbytes accelerate && {py()} -c \"import numpy, pandas, pyarrow, modelscope; print('dependency check OK: python=' + __import__('sys').executable + ' numpy=' + numpy.__version__)\""),
+        ("7/7 修复并验证运行依赖", f"{py()} -m pip install --progress-bar off 'numpy>=2.0,<2.6' 'opencv-python<4.12' bitsandbytes accelerate && {py()} -c \"import numpy, pandas, pyarrow, modelscope; print('dependency check OK: python=' + __import__('sys').executable + ' numpy=' + numpy.__version__)\""),
     ]
     INSTALL_LOG.parent.mkdir(parents=True, exist_ok=True)
     with INSTALL_LOG.open("a", encoding="utf-8") as log_file:
@@ -254,11 +256,10 @@ def pose_gallery_root(require_data: bool = False) -> Path:
     return (REPOS / "ai-pose-gallery-zh").resolve()
 
 def _has_cached_file(filename: str) -> bool:
-    cache = HOME / "modelscope-cache"
-    if not cache.is_dir():
+    if not MODELS.is_dir():
         return False
     try:
-        return next(cache.rglob(filename), None) is not None
+        return next(MODELS.rglob(filename), None) is not None
     except OSError:
         return False
 
@@ -431,7 +432,7 @@ def health_check() -> str:
     )
 
     gib = 2 ** 30
-    model_gb = _tree_bytes([HOME / "modelscope-cache", MODELS]) / gib
+    model_gb = _tree_bytes([MODELS]) / gib
     total_gb = _tree_bytes([HOME]) / gib
     storage_ok = model_gb < MODEL_BUDGET_GB and total_gb < TOTAL_BUDGET_GB
     lines.append(
@@ -683,11 +684,15 @@ def build_h3_generation_command(job_dir, width, height, seed):
     job = Path(job_dir).expanduser().resolve()
     if not (job / "generation.json").is_file():
         raise gr.Error("请先构造批量生成任务")
-    model_cache = HOME / "modelscope-cache"
+    model_cache = MODELS / ".modelscope-cache"
+    model_dir = MODELS
     ensure = f"{py()} {q(ROOT / 'ensure_h3_runtime.py')}"
-    download = f"{py()} {q(ROOT / 'download_h3.py')} --profile quantized --cache-dir {q(model_cache)}"
+    download = f"{py()} {q(ROOT / 'download_h3.py')} --profile quantized --models-dir {q(model_dir)}"
     generate = f"{py()} {q(ROOT / 'generate_h3_targets.py')} --job {q(job)} --width {int(width)} --height {int(height)} --seed {int(seed)}"
-    return f"export MODELSCOPE_CACHE={q(model_cache)} && {ensure} && {download} && {generate}"
+    return (
+        f"export MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
+        f"{ensure} && {download} && DIFFSYNTH_SKIP_DOWNLOAD=1 {generate}"
+    )
 
 
 def start_h3_generation(
@@ -773,7 +778,8 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", output_name.strip()).strip("-.") or "h3-character-lora"
     cache_dir = OUTPUTS / f"{name}-split-cache"
     lora_dir = OUTPUTS / name
-    model_cache = HOME / "modelscope-cache"
+    model_cache = MODELS / ".modelscope-cache"
+    model_dir = MODELS
     bf16_models = (
         "MiniMax/MiniMax-H3:FL2VA/text_encoder/model*.safetensors,"
         "MiniMax/MiniMax-H3-Image:transformer/model*.safetensors,"
@@ -787,7 +793,10 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
         f"--lora_target_modules {q(targets)} --lora_rank {int(rank)} --use_gradient_checkpointing"
     )
     if low_vram:
-        common_tail += " --use_gradient_checkpointing_offload --cpu_offload --optimize_on_cpu --initialize_model_on_cpu"
+        common_tail += (
+            " --use_gradient_checkpointing_offload --enable_model_cpu_offload "
+            "--enable_optimizer_cpu_offload --initialize_model_on_cpu"
+        )
     adapter = Path(adapter_path).expanduser() if adapter_path.strip() else None
     if adapter and not adapter.is_file():
         raise gr.Error("训练适配器路径不存在")
@@ -807,8 +816,11 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
         if adapter:
             train += f" --preset_lora_path {q(adapter)} --preset_lora_model dit"
         ensure = f"{py()} {q(ROOT / 'ensure_h3_runtime.py')}"
-        download = f"{py()} {q(ROOT / 'download_h3.py')} --profile quantized --cache-dir {q(model_cache)}"
-        command = f"export MODELSCOPE_CACHE={q(model_cache)} && {ensure} && {download} && {train}"
+        download = f"{py()} {q(ROOT / 'download_h3.py')} --profile quantized --models-dir {q(model_dir)}"
+        command = (
+            f"export MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
+            f"{ensure} && {download} && export DIFFSYNTH_SKIP_DOWNLOAD=1 && {train}"
+        )
         return command, str(lora_dir)
     common = f"{common_tail} --model_id_with_origin_paths {q(bf16_models)}"
     stage1 = (
@@ -826,8 +838,12 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
     if adapter:
         stage2 += f" --preset_lora_path {q(adapter)} --preset_lora_model dit"
     ensure = f"{py()} {q(ROOT / 'ensure_h3_runtime.py')}"
-    download = f"{py()} {q(ROOT / 'download_h3.py')} --profile bf16 --cache-dir {q(model_cache)}"
-    return f"export MODELSCOPE_CACHE={q(model_cache)} && {ensure} && {download} && {stage1} && {stage2}", str(lora_dir)
+    download = f"{py()} {q(ROOT / 'download_h3.py')} --profile bf16 --models-dir {q(model_dir)}"
+    command = (
+        f"export MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
+        f"{ensure} && {download} && export DIFFSYNTH_SKIP_DOWNLOAD=1 && {stage1} && {stage2}"
+    )
+    return command, str(lora_dir)
 
 
 def write_dataset_config(kind: str, data_dir: str, width: int, height: int, frames: int, repeats: int) -> Path:
@@ -900,7 +916,7 @@ def start_training(command: str) -> str:
         proc = STATE["process"]
         if proc and proc.poll() is None:
             raise gr.Error("已有训练任务正在运行")
-        log_path = LOGS / "latest.log"
+        log_path = LATEST_LOG
         log_file = log_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(["bash", "-lc", command], cwd=HOME, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
         STATE.update(process=proc, log=log_file)
@@ -916,16 +932,21 @@ def stop_training() -> str:
         return f"已向 PID {proc.pid} 发送停止信号"
 
 
-def read_log() -> str:
-    path = LOGS / "latest.log"
+def read_log(limit: int = 250) -> str:
+    path = LATEST_LOG
     status = "未启动"
     proc = STATE["process"]
     if proc:
         status = "运行中" if proc.poll() is None else f"已结束（退出码 {proc.returncode}）"
     if not path.exists():
         return status
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-250:]
-    return status + "\n\n" + "\n".join(lines)
+    try:
+        limit = max(50, min(int(limit), 5000))
+    except (TypeError, ValueError):
+        limit = 250
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    updated = time.strftime("%H:%M:%S", time.localtime(path.stat().st_mtime))
+    return f"{status} · 更新 {updated} · 最近 {len(lines)} 行\n\n" + "\n".join(lines)
 
 
 def list_lora_outputs(output_dir: str):
@@ -1043,7 +1064,14 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
                 auto_status = gr.Textbox(label="生成状态", interactive=False)
                 auto_job_dir = gr.Textbox(label="当前批次目录", interactive=False)
                 auto_summary = gr.Textbox(label="任务摘要", lines=3, interactive=False)
-                auto_log = gr.Textbox(label="生成日志", lines=14, max_lines=24)
+                auto_log = gr.Textbox(
+                    label="生成日志（自动刷新）",
+                    lines=14,
+                    max_lines=24,
+                    show_copy_button=True,
+                    autoscroll=True,
+                )
+                auto_log_file = gr.DownloadButton("下载完整日志", value=str(LATEST_LOG))
 
             with gr.Tab("2 · 筛选整理"):
                 gr.Markdown("刷新候选图，排除失败结果；也可以上传精修图，按顺序替换前 N 张。")
@@ -1100,7 +1128,16 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
                     h3_log_refresh = gr.Button("刷新日志")
                     h3_outputs_refresh = gr.Button("刷新输出")
                 h3_status = gr.Textbox(label="训练状态", interactive=False)
-                h3_log = gr.Textbox(label="训练日志", lines=16, max_lines=26)
+                with gr.Row():
+                    h3_log_lines = gr.Dropdown([100, 250, 1000], value=250, label="日志显示行数")
+                    h3_log_file = gr.DownloadButton("下载完整训练日志", value=str(LATEST_LOG))
+                h3_log = gr.Textbox(
+                    label="训练日志（2 秒自动刷新）",
+                    lines=16,
+                    max_lines=26,
+                    show_copy_button=True,
+                    autoscroll=True,
+                )
                 h3_outputs = gr.Files(label="LoRA 输出文件", interactive=False)
 
             with gr.Tab("4 · 手动数据（高级）"):
@@ -1138,6 +1175,8 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
             [auto_job_dir, auto_summary, auto_command, auto_status],
         )
         auto_stop.click(stop_training, outputs=auto_status)
+        auto_log_timer = gr.Timer(value=2.0, active=True)
+        auto_log_timer.tick(read_log, outputs=auto_log)
         auto_log_refresh.click(read_log, outputs=auto_log)
         auto_refresh.click(refresh_generated_targets, auto_job_dir, auto_gallery)
         auto_finalize.click(
@@ -1155,7 +1194,9 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
             [h3_command, h3_lora_path, h3_status],
         )
         h3_stop.click(stop_training, outputs=h3_status)
-        h3_log_refresh.click(read_log, outputs=h3_log)
+        h3_log_timer = gr.Timer(value=2.0, active=True)
+        h3_log_timer.tick(read_log, inputs=h3_log_lines, outputs=h3_log)
+        h3_log_refresh.click(read_log, inputs=h3_log_lines, outputs=h3_log)
         h3_outputs_refresh.click(list_lora_outputs, h3_lora_path, h3_outputs)
 
         h3_prepare.click(
@@ -1195,7 +1236,16 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
             stop = gr.Button("停止")
             update_log = gr.Button("刷新日志")
         status = gr.Textbox(label="状态")
-        log = gr.Textbox(label="最新日志", lines=20, max_lines=30)
+        log = gr.Textbox(
+            label="最新日志（自动刷新）",
+            lines=20,
+            max_lines=30,
+            show_copy_button=True,
+            autoscroll=True,
+        )
+        log_file = gr.DownloadButton("下载完整日志", value=str(LATEST_LOG))
+        train_log_timer = gr.Timer(value=2.0, active=True)
+        train_log_timer.tick(read_log, outputs=log)
         start.click(start_training, command, status)
         stop.click(stop_training, outputs=status)
         update_log.click(read_log, outputs=log)
@@ -1204,11 +1254,12 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
 if __name__ == "__main__":
     share_enabled = os.environ.get("GRADIO_SHARE", "0").lower() in {"1", "true", "yes", "on"}
     root_path = os.environ.get("GRADIO_ROOT_PATH") or None
+    server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
     demo.queue().launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=server_port,
         share=share_enabled,
         root_path=root_path,
-        allowed_paths=[str(OUTPUTS), str(DATASETS)],
+        allowed_paths=[str(OUTPUTS), str(DATASETS), str(LOGS)],
         show_error=True,
     )

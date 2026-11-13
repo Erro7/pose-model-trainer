@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+
+HOME = Path(os.environ.get("TRAINER_HOME", "/mnt/workspace/pose-model-trainer-data")).expanduser().resolve()
+MODELS_DIR = Path(os.environ.get("DIFFSYNTH_MODEL_BASE_PATH", HOME / "models")).expanduser().resolve()
+CACHE_DIR = MODELS_DIR / ".modelscope-cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = str(MODELS_DIR)
+os.environ["MODELSCOPE_CACHE"] = str(CACHE_DIR)
 
 import torch
 from PIL import Image
