@@ -12,11 +12,15 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
 import gradio as gr
+from loguru import logger
 import psutil
 import toml
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 ROOT = Path(__file__).resolve().parent
@@ -39,6 +43,39 @@ for folder in (REPOS, MODELS, CONFIGS, OUTPUTS, LOGS, DATASETS):
     folder.mkdir(parents=True, exist_ok=True)
 LATEST_LOG = LOGS / "latest.log"
 LATEST_LOG.touch(exist_ok=True)
+LOG_BUFFER: deque[str] = deque(maxlen=5000)
+LOG_LOCK = threading.Lock()
+
+
+def _ui_log_sink(message) -> None:
+    with LOG_LOCK:
+        LOG_BUFFER.append(str(message).rstrip("\n"))
+
+
+def _seed_log_buffer() -> None:
+    try:
+        lines = LATEST_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    with LOG_LOCK:
+        LOG_BUFFER.extend(lines[-LOG_BUFFER.maxlen:])
+
+
+logger.remove()
+logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level} | {message}")
+logger.add(_ui_log_sink, level="INFO", format="{message}")
+_seed_log_buffer()
+logger.add(
+    LATEST_LOG,
+    level="INFO",
+    format="{message}",
+    rotation="20 MB",
+    retention=3,
+    encoding="utf-8",
+    enqueue=True,
+    backtrace=False,
+    diagnose=False,
+)
 
 STATE = {"process": None, "log": None, "lock": threading.Lock()}
 INSTALL_LOG = LOGS / "install-backends.log"
@@ -375,7 +412,15 @@ def health_check() -> str:
     missing = "[缺失]"
     warning = "[待完成]"
     blocked = False
-    lines = ["环境完整性"]
+    lines = [
+        "统一环境检查",
+        "",
+        system_info(),
+        "",
+        storage_info(),
+        "",
+        "组件检查",
+    ]
 
     venv_ok = sys.prefix != sys.base_prefix and Path(sys.executable).parent == ROOT / ".venv/bin"
     task_venv_ok = task_python_path().parent == ROOT / ".venv-h3/bin"
@@ -462,7 +507,8 @@ def health_check() -> str:
         next_step = "下一步：H3 工作流 → 3 · 训练 LoRA。"
     else:
         next_step = "环境和完整流程均已就绪，可继续生成或训练新批次。"
-    lines.extend(["", f"下一步：{next_step}"])
+    overall = "阻塞" if blocked else "可用"
+    lines.extend(["", f"总体状态：{overall}", f"下一步：{next_step}"])
     return "\n".join(lines)
 
 
@@ -690,7 +736,7 @@ def build_h3_generation_command(job_dir, width, height, seed):
     download = f"{py()} {q(ROOT / 'download_h3.py')} --profile quantized --models-dir {q(model_dir)}"
     generate = f"{py()} {q(ROOT / 'generate_h3_targets.py')} --job {q(job)} --width {int(width)} --height {int(height)} --seed {int(seed)}"
     return (
-        f"export MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
+        f"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
         f"{ensure} && {download} && DIFFSYNTH_SKIP_DOWNLOAD=1 {generate}"
     )
 
@@ -818,7 +864,7 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
         ensure = f"{py()} {q(ROOT / 'ensure_h3_runtime.py')}"
         download = f"{py()} {q(ROOT / 'download_h3.py')} --profile quantized --models-dir {q(model_dir)}"
         command = (
-            f"export MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
+            f"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
             f"{ensure} && {download} && export DIFFSYNTH_SKIP_DOWNLOAD=1 && {train}"
         )
         return command, str(lora_dir)
@@ -840,7 +886,7 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
     ensure = f"{py()} {q(ROOT / 'ensure_h3_runtime.py')}"
     download = f"{py()} {q(ROOT / 'download_h3.py')} --profile bf16 --models-dir {q(model_dir)}"
     command = (
-        f"export MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
+        f"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
         f"{ensure} && {download} && export DIFFSYNTH_SKIP_DOWNLOAD=1 && {stage1} && {stage2}"
     )
     return command, str(lora_dir)
@@ -909,6 +955,18 @@ def build_command(task, data_dir, model_path, component1, component2, component3
     return cmd
 
 
+def _pump_process_log(proc: subprocess.Popen) -> None:
+    if proc.stdout is None:
+        return
+    try:
+        for line in proc.stdout:
+            logger.info(line.rstrip("\n"))
+    finally:
+        proc.stdout.close()
+        returncode = proc.wait()
+        logger.info(f"[进程结束] exit={returncode}")
+
+
 def start_training(command: str) -> str:
     if not command.strip():
         raise gr.Error("请先生成命令")
@@ -916,11 +974,21 @@ def start_training(command: str) -> str:
         proc = STATE["process"]
         if proc and proc.poll() is None:
             raise gr.Error("已有训练任务正在运行")
-        log_path = LATEST_LOG
-        log_file = log_path.open("w", encoding="utf-8")
-        proc = subprocess.Popen(["bash", "-lc", command], cwd=HOME, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
-        STATE.update(process=proc, log=log_file)
-    return f"已启动，PID {proc.pid}；日志：{log_path}"
+        logger.info("=" * 72)
+        logger.info(f"任务启动 {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"$ {command}")
+        proc = subprocess.Popen(
+            ["bash", "-lc", command],
+            cwd=HOME,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        STATE.update(process=proc, log=None)
+        threading.Thread(target=_pump_process_log, args=(proc,), daemon=True).start()
+    return f"已启动，PID {proc.pid}；日志：{LATEST_LOG}"
 
 
 def stop_training() -> str:
@@ -928,13 +996,14 @@ def stop_training() -> str:
         proc = STATE["process"]
         if not proc or proc.poll() is not None:
             return "当前没有运行中的任务"
+        logger.info(f"发送停止信号 PID {proc.pid}")
         os.killpg(proc.pid, signal.SIGTERM)
         return f"已向 PID {proc.pid} 发送停止信号"
 
 
 def read_log(limit: int = 250) -> str:
     path = LATEST_LOG
-    status = "未启动"
+    status = "未启动/历史日志"
     proc = STATE["process"]
     if proc:
         status = "运行中" if proc.poll() is None else f"已结束（退出码 {proc.returncode}）"
@@ -944,7 +1013,12 @@ def read_log(limit: int = 250) -> str:
         limit = max(50, min(int(limit), 5000))
     except (TypeError, ValueError):
         limit = 250
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    with LOG_LOCK:
+        buffered = list(LOG_BUFFER)
+    if len(buffered) >= limit:
+        lines = buffered[-limit:]
+    else:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
     updated = time.strftime("%H:%M:%S", time.localtime(path.stat().st_mtime))
     return f"{status} · 更新 {updated} · 最近 {len(lines)} 行\n\n" + "\n".join(lines)
 
@@ -962,24 +1036,14 @@ def list_lora_outputs(output_dir: str):
 with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
     gr.Markdown("# 魔搭 Notebook · 图片 / 视频 LoRA 快速训练器\n24GB 单卡默认配置；先安装环境，再选择数据与权重。")
     with gr.Tab("首页"):
-        gr.Markdown("## 环境与持久存储")
-        health_run = gr.Button("检查并准备完整环境", variant="primary")
+        gr.Markdown("## 统一环境检查")
+        health_run = gr.Button("统一检查并准备完整环境", variant="primary")
         health_result = gr.Textbox(
-            value="点击上方按钮；缺少的 H3 依赖会自动安装，完成后显示环境与流程状态。",
-            label="检查结果与下一步",
-            lines=16,
+            value="点击上方按钮；一次检查系统、存储、WebUI、H3、CUDA、图库、权重和流程状态。缺少的 H3 依赖会自动安装。",
+            label="统一检查结果与下一步",
+            lines=24,
             interactive=False,
         )
-        storage = gr.Textbox(
-            value=storage_info(),
-            label="100GB 存储预算",
-            lines=6,
-            interactive=False,
-        )
-        with gr.Row():
-            storage_refresh = gr.Button("刷新存储用量", variant="primary")
-            refresh = gr.Button("刷新运行环境")
-        info = gr.Textbox(value=system_info(), label="运行环境", lines=7, interactive=False)
         gr.Markdown(
             f"**宿主基线：** `{BASE_IMAGE}` ；H3 使用独立持久环境，不修改镜像自带 torch 2.0/cu117。\\n\\n"
             "**固定策略：模型最多 80GB，生成数据与 LoRA 输出至少预留 20GB。** "
@@ -996,8 +1060,6 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
         health_timer = gr.Timer(value=3.0, active=True)
         health_run.click(start_h3_environment_setup, outputs=health_result, show_progress="hidden")
         health_timer.tick(poll_h3_environment_setup, outputs=health_result, show_progress="hidden")
-        storage_refresh.click(storage_info, outputs=storage)
-        refresh.click(system_info, outputs=info)
         install.click(install_backends, outputs=[install_status, install_log])
         install_log_refresh.click(read_install_log, outputs=[install_status, install_log])
     with gr.Tab("姿势图库"):
@@ -1051,8 +1113,8 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
                         lines=2,
                     )
                     with gr.Row():
-                        auto_width = gr.Number(value=1024, precision=0, label="宽度")
-                        auto_height = gr.Number(value=1024, precision=0, label="高度")
+                        auto_width = gr.Number(value=768, precision=0, label="宽度", info="24GB 建议 768；OOM 时降到 512")
+                        auto_height = gr.Number(value=768, precision=0, label="高度", info="24GB 建议 768；OOM 时降到 512")
                         auto_seed = gr.Number(value=42, precision=0, label="Seed")
                         auto_pose_safe = gr.Checkbox(value=True, label="安全模式")
                         auto_job_name = gr.Textbox(value="h3-auto-targets", label="批次名称")
@@ -1114,7 +1176,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer") as demo:
                         h3_repeats = gr.Number(value=5, precision=0, label="数据重复")
                         h3_epochs = gr.Number(value=1, precision=0, label="Epoch")
                     with gr.Row():
-                        h3_pixels = gr.Number(value=1048576, precision=0, label="最大像素")
+                        h3_pixels = gr.Number(value=589824, precision=0, label="最大像素", info="24GB 建议 ≤589824；OOM 时降到 262144")
                         h3_low_vram = gr.Checkbox(value=True, label="低显存 CPU Offload")
                     h3_adapter = gr.Textbox(
                         label="训练适配器（可选）",

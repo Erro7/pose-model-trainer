@@ -13,6 +13,7 @@ CACHE_DIR = MODELS_DIR / ".modelscope-cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = str(MODELS_DIR)
 os.environ["MODELSCOPE_CACHE"] = str(CACHE_DIR)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from PIL import Image
@@ -35,8 +36,8 @@ def register(model_id: str, pattern: str, vram: dict) -> ModelConfig:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--job", required=True)
-    parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--width", type=int, default=768)
+    parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     job = Path(args.job).resolve()
@@ -47,6 +48,8 @@ def main() -> None:
         "preparing_dtype": torch.bfloat16, "preparing_device": "cuda",
         "computation_dtype": torch.bfloat16, "computation_device": "cuda",
     }
+    total_gib = torch.cuda.mem_get_info("cuda")[1] / 2**30
+    vram_limit = max(total_gib - 2.5, 1.0)
     pipe = MiniMaxH3ImagePipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device="cuda",
@@ -57,8 +60,10 @@ def main() -> None:
             ModelConfig(model_id="DiffSynth-Studio/MiniMax-H3-Image-EntroPack", origin_file_pattern="models/vae_int8.safetensors", **vram),
         ],
         processor_config=ModelConfig(model_id="MiniMax/MiniMax-H3-Image", origin_file_pattern="processor/"),
-        vram_limit=max(torch.cuda.mem_get_info("cuda")[1] / 2**30 - 0.5, 1),
+        vram_limit=vram_limit,
     )
+    torch.cuda.empty_cache()
+    print(f"[generate] vram_limit={vram_limit:.1f}GiB", flush=True)
     targets = job / "targets"
     targets.mkdir(exist_ok=True)
     for index, item in enumerate(manifest, 1):
@@ -68,6 +73,7 @@ def main() -> None:
             continue
         refs = [Image.open(job / path).convert("RGB") for path in item["edit_image"]]
         print(f"[generate] {index}/{len(manifest)} {item['pose_name']}", flush=True)
+        torch.cuda.empty_cache()
         image = pipe(prompt=item["prompt"], edit_image=refs, width=args.width, height=args.height, seed=args.seed + index - 1)
         image.save(output)
     print("[generate] batch complete", flush=True)

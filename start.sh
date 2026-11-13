@@ -39,6 +39,7 @@ export GRADIO_SHARE="${GRADIO_SHARE:-0}"
 export PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}"
 export PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-mirrors.aliyun.com}"
 export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-120}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 unset GRADIO_ROOT_PATH
 
 echo "[bootstrap] PyPI source: ${PIP_INDEX_URL}"
