@@ -1,0 +1,8 @@
+.venv/
+.venv-h3/
+__pycache__/
+*.pyc
+.DS_Store
+/.dsw-config.json
+/config.toml
+
