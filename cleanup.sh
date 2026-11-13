@@ -6,6 +6,8 @@ TRAINER_HOME="${TRAINER_HOME:-/mnt/workspace/pose-model-trainer-data}"
 MODELS_DIR="${DIFFSYNTH_MODEL_BASE_PATH:-${TRAINER_HOME}/models}"
 LEGACY_CACHE="${TRAINER_HOME}/modelscope-cache"
 LOGS_DIR="${TRAINER_HOME}/logs"
+LOG_MODULE=cleanup
+source "${ROOT_DIR}/shell_log.sh"
 
 APPLY=0
 STOP_PROCESSES=0
@@ -28,7 +30,7 @@ while [[ $# -gt 0 ]]; do
     --stop-processes) STOP_PROCESSES=1 ;;
     --legacy-cache) CLEAN_LEGACY=1 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *) log_error "unknown option: $1"; usage >&2; exit 2 ;;
   esac
   shift
 done
@@ -67,10 +69,10 @@ stop_processes() {
   for pattern in "${patterns[@]}"; do
     if pgrep -f -- "$pattern" >/dev/null 2>&1; then
       if (( APPLY )); then
-        echo "[cleanup] stopping: ${pattern}"
+        log_info "stopping: ${pattern}"
         pkill -TERM -f -- "$pattern" || true
       else
-        echo "[cleanup] would stop: ${pattern}"
+        log_info "would stop: ${pattern}"
         pgrep -af -- "$pattern" || true
       fi
     fi
@@ -109,13 +111,13 @@ migrate_legacy_file() {
   if (( APPLY )); then
     mkdir -p -- "$(dirname -- "${dst}")"
     if ln -- "${src}" "${dst}" 2>/dev/null; then
-      echo "[cleanup] linked ${dst}"
+      log_info "linked ${dst}"
     else
-      echo "[cleanup] copied ${dst}"
+      log_info "copied ${dst}"
       cp --reflink=auto --sparse=always -- "${src}" "${dst}"
     fi
   else
-    echo "[cleanup] would migrate ${dst}"
+    log_info "would migrate ${dst}"
   fi
 }
 
@@ -152,30 +154,30 @@ fi
 
 if (( CLEAN_LEGACY )); then
   if [[ ! -d "${LEGACY_CACHE}" ]]; then
-    echo "[cleanup] legacy cache does not exist: ${LEGACY_CACHE}"
+    log_info "legacy cache does not exist: ${LEGACY_CACHE}"
   elif processes_running && (( ! STOP_PROCESSES )); then
-    echo "[cleanup] skip legacy cache while trainer processes are running; add --stop-processes"
+    log_warn "skip legacy cache while trainer processes are running; add --stop-processes"
   else
     if ! required_models_present; then
       if (( APPLY )); then
-        echo "[cleanup] migrating required files from ${LEGACY_CACHE}"
+        log_info "migrating required files from ${LEGACY_CACHE}"
         migrate_legacy_models
       else
-        echo "[cleanup] would migrate missing H3 files from ${LEGACY_CACHE}"
+        log_info "would migrate missing H3 files from ${LEGACY_CACHE}"
       fi
     fi
     if required_models_present; then
       legacy_size="$(du -sh "${LEGACY_CACHE}" 2>/dev/null | awk '{print $1}' || true)"
       if (( APPLY )); then
-        echo "[cleanup] removing legacy cache ${LEGACY_CACHE} (${legacy_size:-unknown})"
+        log_info "removing legacy cache ${LEGACY_CACHE} (${legacy_size:-unknown})"
         rm -rf -- "${LEGACY_CACHE}"
       else
-        echo "[cleanup] would remove legacy cache ${LEGACY_CACHE} (${legacy_size:-unknown})"
+        log_info "would remove legacy cache ${LEGACY_CACHE} (${legacy_size:-unknown})"
       fi
     elif (( ! APPLY )); then
-      echo "[cleanup] dry-run: legacy cache would be removed after migration"
+      log_info "dry-run: legacy cache would be removed after migration"
     else
-      echo "[cleanup] skip legacy cache: required models are not complete in ${MODELS_DIR}"
+      log_warn "skip legacy cache: required models are not complete in ${MODELS_DIR}"
     fi
   fi
 fi
@@ -187,26 +189,26 @@ state_files=(
 )
 
 if processes_running && (( ! STOP_PROCESSES )); then
-  echo "[cleanup] skip runtime state cleanup while trainer processes are running; add --stop-processes"
+  log_warn "skip runtime state cleanup while trainer processes are running; add --stop-processes"
 else
   for state_file in "${state_files[@]}"; do
     [[ -e "${state_file}" ]] || continue
     if (( APPLY )); then
-      echo "[cleanup] removing ${state_file}"
+      log_info "removing ${state_file}"
       rm -f -- "${state_file}"
     else
-      echo "[cleanup] would remove ${state_file}"
+      log_info "would remove ${state_file}"
     fi
   done
 fi
 
 if (( APPLY )); then
-  echo "[cleanup] disk after cleanup:"
+  log_info "disk after cleanup:"
   if [[ -d "${TRAINER_HOME}" ]]; then
-    df -h "${TRAINER_HOME}" | tail -n1
+    log_info "$(df -h "${TRAINER_HOME}" | tail -n1)"
   else
-    echo "${TRAINER_HOME} does not exist"
+    log_warn "${TRAINER_HOME} does not exist"
   fi
 else
-  echo "[cleanup] dry-run only; add --yes to apply"
+  log_info "dry-run only; add --yes to apply"
 fi

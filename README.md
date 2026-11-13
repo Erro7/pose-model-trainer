@@ -88,6 +88,7 @@ TRAINER_MODEL_BUDGET_GB=80
 - 首轮只需上传人物：自动从三合一仓库配对服装图与 Pose 图，读取服装名称/英文关键词及姿势体系/分类/名称/角度，构造多参考提示词并生成候选目标图
 - 自动生成数据集 TOML、训练命令预览、后台训练和停止任务
 - 基于 `loguru` 的训练日志写入/轮转，WebUI 自动刷新、自动滚动、复制和完整日志下载
+- 启动器、清理脚本与 WebUI 控制台统一为 `YYYY-MM-DD HH:mm:ss | LEVEL | [模块] 消息`，启动日志写入 `logs/launcher.log`（20MB 轮转、保留 3 份），pip 正常输出降噪，失败时打印尾部诊断
 - 低显存默认值：bf16、gradient checkpointing、8-bit AdamW、缓存 latent / 文本编码器输出
 
 ## 手动启动

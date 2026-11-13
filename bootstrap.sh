@@ -10,6 +10,62 @@ WORKSPACE="${MODELSCOPE_WORKSPACE:-/mnt/workspace}"
 REPO_DIR="${WORKSPACE}/pose-model-trainer"
 RECOMMENDED_IMAGE="modelscope:1.40.1-pytorch2.13.0-gpu-py312-cu130-ubuntu22.04"
 GITHUB_PROXY="${GITHUB_PROXY:-https://ghfast.top/}"
+TRAINER_HOME="${TRAINER_HOME:-${WORKSPACE}/pose-model-trainer-data}"
+export TRAINER_HOME
+LOG_MODULE=bootstrap
+LAUNCHER_LOG="${TRAINER_HOME}/logs/launcher.log"
+mkdir -p -- "$(dirname -- "${LAUNCHER_LOG}")"
+
+rotate_launcher_log() {
+  local max_bytes=$((20 * 1024 * 1024))
+  [[ -f "${LAUNCHER_LOG}" ]] || return 0
+  local size
+  size="$(stat -c '%s' "${LAUNCHER_LOG}" 2>/dev/null || echo 0)"
+  (( size < max_bytes )) && return 0
+  rm -f -- "${LAUNCHER_LOG}.3"
+  [[ -f "${LAUNCHER_LOG}.2" ]] && mv -f -- "${LAUNCHER_LOG}.2" "${LAUNCHER_LOG}.3"
+  [[ -f "${LAUNCHER_LOG}.1" ]] && mv -f -- "${LAUNCHER_LOG}.1" "${LAUNCHER_LOG}.2"
+  mv -f -- "${LAUNCHER_LOG}" "${LAUNCHER_LOG}.1"
+}
+
+_log() {
+  local level="$1"
+  shift
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') | ${level} | [${LOG_MODULE}] $*"
+  if [[ "${level}" == "ERROR" ]]; then
+    printf '%s\n' "${line}" >&2
+  else
+    printf '%s\n' "${line}"
+  fi
+  printf '%s\n' "${line}" >> "${LAUNCHER_LOG}" 2>/dev/null || true
+}
+
+log_info() { _log INFO "$@"; }
+log_warn() { _log WARNING "$@"; }
+log_error() { _log ERROR "$@"; }
+
+run_logged() {
+  local label="$1"
+  shift
+  local temp_file rc=0
+  temp_file="$(mktemp)"
+  log_info "${label}：开始"
+  "$@" >"${temp_file}" 2>&1 || rc=$?
+  if (( rc == 0 )); then
+    rm -f -- "${temp_file}"
+    log_info "${label}：完成"
+    return 0
+  fi
+  while IFS= read -r line; do
+    log_warn "${line}"
+  done < <(tail -n 80 "${temp_file}" 2>/dev/null || true)
+  rm -f -- "${temp_file}"
+  log_error "${label}：失败（exit=${rc}）"
+  return "${rc}"
+}
+
+rotate_launcher_log
 
 if [[ -n "${GITHUB_PROXY}" ]]; then
   GITHUB_PROXY="${GITHUB_PROXY%/}/"
@@ -17,20 +73,20 @@ if [[ -n "${GITHUB_PROXY}" ]]; then
   export GIT_CONFIG_COUNT=1
   export GIT_CONFIG_KEY_0="url.${GITHUB_PROXY}https://github.com/.insteadOf"
   export GIT_CONFIG_VALUE_0="https://github.com/"
-  echo "[bootstrap] GitHub proxy: ${GITHUB_PROXY}"
+  log_info "GitHub proxy: ${GITHUB_PROXY}"
 else
-  echo "[bootstrap] GitHub proxy: direct"
+  log_info "GitHub proxy: direct"
 fi
 
-echo "[preflight] checking Python and NVIDIA runtime"
+log_info "preflight: checking Python and NVIDIA runtime"
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "[preflight] incompatible: python3 is missing"
-  echo "[preflight] recommended image: ${RECOMMENDED_IMAGE}"
+  log_error "preflight: python3 is missing"
+  log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
   exit 1
 fi
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "[preflight] incompatible: NVIDIA GPU is not visible"
-  echo "[preflight] create a GPU Notebook with: ${RECOMMENDED_IMAGE}"
+  log_error "preflight: NVIDIA GPU is not visible"
+  log_error "preflight: create a GPU Notebook with: ${RECOMMENDED_IMAGE}"
   exit 1
 fi
 
@@ -42,13 +98,13 @@ GPU_INFO="$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 SYSTEM_TORCH="$(python3 -c 'import torch; print(f"{torch.__version__} cuda={torch.version.cuda}")' 2>/dev/null || echo 'not installed')"
 
 if [[ "${PYTHON_OK}" != "1" ]]; then
-  echo "[preflight] incompatible: Python ${PYTHON_VERSION}; H3 requires Python 3.10+"
-  echo "[preflight] recommended image: ${RECOMMENDED_IMAGE}"
+  log_error "preflight: Python ${PYTHON_VERSION}; H3 requires Python 3.10+"
+  log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
   exit 1
 fi
 if [[ -z "${CUDA_MAX}" ]]; then
-  echo "[preflight] incompatible: cannot determine the driver CUDA capability"
-  echo "[preflight] recommended image: ${RECOMMENDED_IMAGE}"
+  log_error "preflight: cannot determine the driver CUDA capability"
+  log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
   exit 1
 fi
 
@@ -59,8 +115,8 @@ elif awk -v version="${CUDA_MAX}" 'BEGIN { exit !(version + 0 >= 12.8) }'; then
   export TRAINER_RUNTIME_PROFILE="cu128"
   PREFLIGHT_RESULT="compatible fallback"
 else
-  echo "[preflight] incompatible: driver supports CUDA ${CUDA_MAX}; H3 EntroPack needs CUDA 12.8+"
-  echo "[preflight] recommended image: ${RECOMMENDED_IMAGE}"
+  log_error "preflight: driver supports CUDA ${CUDA_MAX}; H3 EntroPack needs CUDA 12.8+"
+  log_error "preflight: recommended image: ${RECOMMENDED_IMAGE}"
   exit 1
 fi
 
@@ -72,32 +128,31 @@ if [[ -z "${TRAINER_BASE_IMAGE:-}" ]]; then
   fi
 fi
 
-echo "[preflight] result: ${PREFLIGHT_RESULT}"
-echo "[preflight] Python: ${PYTHON_VERSION}"
-echo "[preflight] GPU: ${GPU_INFO:-unknown}"
-echo "[preflight] driver CUDA: ${CUDA_MAX}"
-echo "[preflight] system torch: ${SYSTEM_TORCH}"
-echo "[preflight] selected H3 profile: ${TRAINER_RUNTIME_PROFILE}"
+log_info "preflight: result: ${PREFLIGHT_RESULT}"
+log_info "preflight: Python: ${PYTHON_VERSION}"
+log_info "preflight: GPU: ${GPU_INFO:-unknown}"
+log_info "preflight: driver CUDA: ${CUDA_MAX}"
+log_info "preflight: system torch: ${SYSTEM_TORCH}"
+log_info "preflight: selected H3 profile: ${TRAINER_RUNTIME_PROFILE}"
 if [[ "${PREFLIGHT_RESULT}" != "recommended" || "${PYTHON_VERSION}" != "3.12" ]]; then
-  echo "[preflight] continuing with an isolated compatible runtime"
-  echo "[preflight] recommended for future instances: ${RECOMMENDED_IMAGE}"
+  log_warn "preflight: continuing with an isolated compatible runtime"
+  log_warn "preflight: recommended for future instances: ${RECOMMENDED_IMAGE}"
 fi
 
 mkdir -p "${WORKSPACE}"
 if [[ -d "${REPO_DIR}/.git" ]]; then
-  git -C "${REPO_DIR}" pull --ff-only
+  run_logged "更新项目仓库" git -C "${REPO_DIR}" pull --ff-only
 else
-  git clone --depth 1 https://github.com/Erro7/pose-model-trainer.git "${REPO_DIR}"
+  run_logged "克隆项目仓库" git clone --depth 1 https://github.com/Erro7/pose-model-trainer.git "${REPO_DIR}"
 fi
 
-export TRAINER_HOME="${TRAINER_HOME:-${WORKSPACE}/pose-model-trainer-data}"
 export TRAINER_TOTAL_BUDGET_GB="${TRAINER_TOTAL_BUDGET_GB:-100}"
 export TRAINER_MODEL_BUDGET_GB="${TRAINER_MODEL_BUDGET_GB:-80}"
 export GRADIO_SHARE="${GRADIO_SHARE:-0}"
 unset GRADIO_ROOT_PATH
 
 if pgrep -f "${REPO_DIR}/app.py" >/dev/null 2>&1; then
-  echo "[bootstrap] stopping previous trainer process"
+  log_info "stopping previous trainer process"
   pkill -TERM -f "${REPO_DIR}/app.py" || true
   for _ in {1..20}; do
     pgrep -f "${REPO_DIR}/app.py" >/dev/null 2>&1 || break
@@ -105,4 +160,5 @@ if pgrep -f "${REPO_DIR}/app.py" >/dev/null 2>&1; then
   done
 fi
 
+log_info "delegating to start.sh"
 exec bash "${REPO_DIR}/start.sh" "$@"

@@ -54,6 +54,7 @@ LATEST_LOG = LOGS / "latest.log"
 LATEST_LOG.touch(exist_ok=True)
 LOG_BUFFER: deque[str] = deque(maxlen=5000)
 LOG_LOCK = threading.Lock()
+LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
 
 
 def _ui_log_sink(message) -> None:
@@ -71,13 +72,13 @@ def _seed_log_buffer() -> None:
 
 
 logger.remove()
-logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level} | {message}")
-logger.add(_ui_log_sink, level="INFO", format="{message}")
+logger.add(sys.stderr, level="INFO", format=LOG_FORMAT)
+logger.add(_ui_log_sink, level="INFO", format=LOG_FORMAT)
 _seed_log_buffer()
 logger.add(
     LATEST_LOG,
     level="INFO",
-    format="{message}",
+    format=LOG_FORMAT,
     rotation="20 MB",
     retention=3,
     encoding="utf-8",
