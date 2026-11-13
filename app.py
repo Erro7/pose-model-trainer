@@ -54,7 +54,7 @@ LATEST_LOG = LOGS / "latest.log"
 LATEST_LOG.touch(exist_ok=True)
 LOG_BUFFER: deque[str] = deque(maxlen=5000)
 LOG_LOCK = threading.Lock()
-LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+LOG_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level} | [webui] {message}"
 
 
 def _ui_log_sink(message) -> None:
