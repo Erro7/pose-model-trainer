@@ -84,6 +84,22 @@ STATE = {"process": None, "log": None, "lock": threading.Lock()}
 INSTALL_LOG = LOGS / "install-backends.log"
 INSTALL_STATE = {"running": False, "step": "尚未开始", "returncode": None, "lock": threading.Lock()}
 
+CUSTOM_GENERATION_SIZE = "自定义尺寸（高级）"
+COMMON_GENERATION_SIZES = (
+    (512, 512, "1:1 方形"),
+    (512, 768, "2:3 竖版"),
+    (768, 512, "3:2 横版"),
+    (640, 896, "5:7 竖版"),
+    (896, 640, "7:5 横版"),
+    (768, 768, "1:1 方形"),
+    (768, 1024, "3:4 竖版"),
+    (1024, 768, "4:3 横版"),
+    (832, 1216, "2:3 竖版"),
+    (1216, 832, "3:2 横版"),
+    (1024, 1024, "1:1 方形"),
+    (1216, 1216, "1:1 方形"),
+)
+
 
 def q(value: object) -> str:
     return shlex.quote(str(value))
@@ -93,6 +109,111 @@ def task_python_path() -> Path:
     configured = os.environ.get("TRAINER_TASK_PYTHON", "").strip()
     candidate = Path(configured) if configured else ROOT / ".venv-h3/bin/python"
     return candidate if candidate.is_file() else Path(sys.executable)
+
+
+def generation_hardware() -> dict:
+    gpu_name, vram_gib = "", None
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+        )
+        first_line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+        if first_line:
+            gpu_name, _, memory = first_line.rpartition(",")
+            vram_gib = float(memory.strip()) / 1024
+    except (FileNotFoundError, ValueError, IndexError):
+        pass
+
+    ram_gib = psutil.virtual_memory().total / 2**30
+    vram_budget = 0.0
+    for threshold, megapixels in ((40, 1.5), (28, 1.05), (18, 0.59), (12, 0.39), (6, 0.26)):
+        if vram_gib is not None and vram_gib >= threshold:
+            vram_budget = megapixels
+            break
+    ram_budget = 0.0
+    for threshold, megapixels in ((64, 1.5), (40, 1.05), (24, 0.79), (16, 0.59), (12, 0.39), (8, 0.26)):
+        if ram_gib >= threshold:
+            ram_budget = megapixels
+            break
+    if vram_gib is None:
+        safe_megapixels = 0.26
+    else:
+        safe_megapixels = min(vram_budget, ram_budget) or 0.26
+    return {
+        "gpu_name": gpu_name or "未检测到 NVIDIA GPU",
+        "vram_gib": vram_gib,
+        "ram_gib": ram_gib,
+        "safe_megapixels": safe_megapixels,
+    }
+
+
+def generation_size_options() -> tuple[list[str], str, str]:
+    hardware = generation_hardware()
+    safe_megapixels = hardware["safe_megapixels"]
+    eligible = [
+        (width, height, aspect)
+        for width, height, aspect in COMMON_GENERATION_SIZES
+        if width * height <= safe_megapixels * 1_000_000
+    ]
+    if not eligible:
+        eligible = [COMMON_GENERATION_SIZES[0]]
+    preferred = ((768, 768), (512, 768), (512, 512))
+    default_size = next(
+        (size for size in preferred if any((size[0], size[1]) == (item[0], item[1]) for item in eligible)),
+        (eligible[-1][0], eligible[-1][1]),
+    )
+    choices = []
+    for width, height, aspect in eligible:
+        label = f"{width} × {height} · {aspect}"
+        if (width, height) == default_size:
+            label += " · 推荐"
+        choices.append(label)
+    choices.append(CUSTOM_GENERATION_SIZE)
+    default_choice = next(
+        (choice for choice in choices if choice.startswith(f"{default_size[0]} × {default_size[1]}")),
+        choices[0],
+    )
+
+    if hardware["vram_gib"] is None:
+        gpu_text = "未检测到 NVIDIA GPU；当前尺寸仅作预览，请先修复环境"
+    else:
+        gpu_text = f"{hardware['gpu_name']} · {hardware['vram_gib']:.1f} GiB 显存"
+    safe_text = f"≤ {safe_megapixels:.2f} MP（约 {int(safe_megapixels * 1_000_000):,} 像素）"
+    available = "、".join(f"{width}×{height}" for width, height, _ in eligible)
+    guidance = (
+        f"当前硬件：{gpu_text} · 系统内存 {hardware['ram_gib']:.1f} GiB\n"
+        f"H3 量化多参考安全预算：{safe_text}\n"
+        f"可选常用尺寸：{available}\n"
+        "安全预算同时考虑显存、系统内存与模型卸载需求；超出预算的自定义尺寸可能 OOM。"
+    )
+    return choices, default_choice, guidance
+
+
+def resolve_generation_size(size_choice: str, width: int, height: int) -> tuple[int, int]:
+    if size_choice != CUSTOM_GENERATION_SIZE:
+        match = re.match(r"(\d+)\s*×\s*(\d+)", size_choice or "")
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    width, height = int(width or 0), int(height or 0)
+    if width < 256 or height < 256 or width > 2048 or height > 2048:
+        raise gr.Error("自定义宽高需在 256–2048 之间")
+    if width % 16 or height % 16:
+        raise gr.Error("自定义宽高需为 16 的倍数，例如 768 × 768")
+    safe_pixels = int(generation_hardware()["safe_megapixels"] * 1_000_000)
+    if width * height > safe_pixels:
+        raise gr.Error(
+            f"自定义尺寸 {width}×{height} 超出当前硬件的安全预算 {safe_pixels:,} 像素。"
+            "请选择列表中的常用尺寸，或降低宽高。"
+        )
+    return width, height
+
+
+def refresh_generation_size_ui(current_choice: str):
+    choices, default, guidance = generation_size_options()
+    value = current_choice if current_choice in choices else default
+    return gr.update(choices=choices, value=value), guidance
 
 
 def py() -> str:
@@ -751,15 +872,16 @@ def build_h3_generation_command(job_dir, width, height, seed):
 
 def start_h3_generation(
     people, outfits, portrait_keyword, pose_keyword, costume_keyword,
-    max_items, safe_only, job_name, instruction, width, height, seed,
+    max_items, safe_only, job_name, instruction, size_choice, width, height, seed,
 ):
+    width, height = resolve_generation_size(size_choice, width, height)
     job_dir, summary = prepare_h3_generation_job(
         people, outfits, portrait_keyword, pose_keyword, costume_keyword,
         max_items, safe_only, job_name, instruction,
     )
     command = build_h3_generation_command(job_dir, width, height, seed)
     status = start_training(command)
-    return job_dir, summary, command, status
+    return job_dir, f"{summary}\n画面尺寸：{width} × {height}", command, status
 
 
 def start_h3_lora(
@@ -1041,6 +1163,9 @@ def list_lora_outputs(output_dir: str):
     return [str(path) for path in sorted(root.rglob("*.safetensors"), key=lambda item: item.stat().st_mtime, reverse=True)]
 
 
+generation_size_choices, generation_size_default, generation_size_guidance = generation_size_options()
+
+
 with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo:
     gr.Markdown("# 魔搭 Notebook · 图片 / 视频 LoRA 快速训练器\n24GB 单卡默认配置；先安装环境，再选择数据与权重。")
     with gr.Tab("首页"):
@@ -1078,7 +1203,11 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         with gr.Row():
             pose_keyword = gr.Textbox(label="关键词（可留空）", placeholder="例如：站姿、侧面、挥手")
             pose_limit = gr.Number(value=100, minimum=1, maximum=1439, precision=0, label="最多导入")
-            pose_safe = gr.Checkbox(value=True, label="安全模式")
+            pose_safe = gr.Checkbox(
+                value=True,
+                label="18+ 安全过滤",
+                info="排除性感、双人缠绵等标记分类",
+            )
         make_pose_data = gr.Button("生成可训练数据集")
         pose_data_path = gr.Textbox(label="数据集路径")
         pose_preview = gr.Textbox(label="生成结果", lines=12)
@@ -1109,22 +1238,41 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                         value=4, minimum=1, maximum=200, precision=0,
                         label="生成数量",
                     )
+                with gr.Row():
+                    auto_pose_safe = gr.Checkbox(
+                        value=True,
+                        label="18+ 安全过滤（推荐开启）",
+                        info="排除性感、内衣/泳装、双人缠绵等图库分类",
+                    )
+                    auto_size = gr.Dropdown(
+                        choices=generation_size_choices,
+                        value=generation_size_default,
+                        label="常用画面尺寸",
+                        info="仅显示当前显存与系统内存可安全支持的尺寸",
+                    )
+                    auto_size_refresh = gr.Button("重新检测尺寸")
+                auto_size_info = gr.Textbox(
+                    value=generation_size_guidance,
+                    label="尺寸建议",
+                    lines=5,
+                    interactive=False,
+                )
+                auto_instruction = gr.Textbox(
+                    value="Create a high-quality realistic full-body fashion photograph with coherent anatomy, natural lighting and a clean background.",
+                    label="附加画面要求",
+                    lines=2,
+                )
                 with gr.Accordion("自定义参考（可选）", open=False):
                     gr.Markdown("上传后会覆盖对应的图库随机参考。")
                     with gr.Row():
                         auto_people = gr.Files(label="自定义人物", file_types=["image"])
                         auto_outfits = gr.Files(label="自定义服装", file_types=["image"])
-                with gr.Accordion("画面与尺寸（高级）", open=False):
-                    auto_instruction = gr.Textbox(
-                        value="Create a high-quality realistic full-body fashion photograph with coherent anatomy, natural lighting and a clean background.",
-                        label="附加画面要求",
-                        lines=2,
-                    )
+                with gr.Accordion("自定义尺寸与任务参数（高级）", open=False):
+                    gr.Markdown("常用尺寸会自动带入；只有选择“自定义尺寸（高级）”时才使用下面宽高。宽高需为 16 的倍数且不能超过安全预算。")
                     with gr.Row():
-                        auto_width = gr.Number(value=768, precision=0, label="宽度", info="24GB 建议 768；OOM 时降到 512")
-                        auto_height = gr.Number(value=768, precision=0, label="高度", info="24GB 建议 768；OOM 时降到 512")
+                        auto_width = gr.Number(value=768, precision=0, label="自定义宽度")
+                        auto_height = gr.Number(value=768, precision=0, label="自定义高度")
                         auto_seed = gr.Number(value=42, precision=0, label="Seed")
-                        auto_pose_safe = gr.Checkbox(value=True, label="安全模式")
                         auto_job_name = gr.Textbox(value="h3-auto-targets", label="批次名称")
                     auto_command = gr.Textbox(label="自动命令", lines=4)
                 auto_start = gr.Button("生成目标图", variant="primary")
@@ -1240,9 +1388,14 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                 auto_people, auto_outfits, auto_portrait_keyword,
                 auto_pose_keyword, auto_costume_keyword, auto_pose_count,
                 auto_pose_safe, auto_job_name, auto_instruction,
-                auto_width, auto_height, auto_seed,
+                auto_size, auto_width, auto_height, auto_seed,
             ],
             [auto_job_dir, auto_summary, auto_command, auto_status],
+        )
+        auto_size_refresh.click(
+            refresh_generation_size_ui,
+            auto_size,
+            [auto_size, auto_size_info],
         )
         auto_stop.click(stop_training, outputs=auto_status)
         auto_log_timer = gr.Timer(value=2.0, active=True)
