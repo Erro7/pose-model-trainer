@@ -87,7 +87,13 @@ logger.add(
     diagnose=False,
 )
 
-STATE = {"process": None, "log": None, "lock": threading.Lock()}
+STATE = {"process": None, "log": None, "task": None, "lock": threading.Lock()}
+TASK_STATE_FILE = LOGS / "task-state.json"
+TASK_LABELS = {
+    "h3-generate": "H3 目标图生成",
+    "h3-train": "H3 LoRA 训练",
+    "train": "LoRA 训练",
+}
 INSTALL_LOG = LOGS / "install-backends.log"
 INSTALL_STATE = {"running": False, "step": "尚未开始", "returncode": None, "lock": threading.Lock()}
 
@@ -299,7 +305,7 @@ def system_info() -> str:
 
 
 def run_visible(command: str) -> str:
-    proc = subprocess.run(["bash", "-lc", command], cwd=HOME, text=True, capture_output=True)
+    proc = subprocess.run(["bash", "-c", command], cwd=HOME, text=True, capture_output=True)
     text = (proc.stdout + "\n" + proc.stderr).strip()
     if proc.returncode:
         raise gr.Error(text[-5000:] or f"命令失败，退出码 {proc.returncode}")
@@ -361,7 +367,7 @@ def install_backends():
                 env = os.environ.copy()
                 env.update(PYTHONUNBUFFERED="1", PIP_DISABLE_PIP_VERSION_CHECK="1")
                 proc = subprocess.Popen(
-                    ["bash", "-lc", command],
+                    ["bash", "-c", command],
                     cwd=HOME,
                     text=True,
                     stdout=subprocess.PIPE,
@@ -891,8 +897,9 @@ def start_h3_generation(
         max_items, safe_only, job_name, instruction,
     )
     command = build_h3_generation_command(job_dir, width, height, seed)
-    status = start_training(command)
-    return job_dir, f"{summary}\n画面尺寸：{width} × {height}", command, status
+    summary = f"{summary}\n画面尺寸：{width} × {height}"
+    status = start_training(command, "h3-generate", {"job_dir": job_dir, "summary": summary, "command": command})
+    return job_dir, summary, command, status
 
 
 def start_h3_lora(
@@ -903,7 +910,11 @@ def start_h3_lora(
         dataset_dir, output_name, model_profile, repeats, epochs,
         rank, lr, max_pixels, adapter_path, low_vram,
     )
-    status = start_training(command)
+    status = start_training(
+        command,
+        "h3-train",
+        {"dataset_dir": str(Path(dataset_dir).expanduser().resolve()), "output_dir": output_dir, "command": command},
+    )
     return command, output_dir, status
 
 
@@ -1096,6 +1107,160 @@ def build_command(task, data_dir, model_path, component1, component2, component3
     return cmd
 
 
+def _now_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _elapsed_text(started_at: str) -> str:
+    try:
+        started = time.mktime(time.strptime(started_at, "%Y-%m-%d %H:%M:%S"))
+    except (TypeError, ValueError, OverflowError):
+        return "--:--:--"
+    seconds = max(0, int(time.time() - started))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        process = psutil.Process(int(pid))
+    except (psutil.Error, TypeError, ValueError):
+        return False
+    try:
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return False
+
+
+def _load_task_state() -> dict | None:
+    try:
+        data = json.loads(TASK_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_task_state(task: dict) -> None:
+    temp_path = TASK_STATE_FILE.with_name(f"{TASK_STATE_FILE.name}.tmp")
+    try:
+        temp_path.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, TASK_STATE_FILE)
+    except OSError:
+        pass
+
+
+def _reconcile_task_locked() -> dict | None:
+    task = STATE.get("task") or _load_task_state()
+    if task and task.get("status") == "running" and not _pid_alive(task.get("pid")):
+        task.update(status="finished", finished_at=task.get("finished_at") or _now_text())
+        _write_task_state(task)
+    STATE["task"] = task
+    return task
+
+
+def current_task_snapshot() -> dict | None:
+    with STATE["lock"]:
+        task = _reconcile_task_locked()
+        return dict(task) if task else None
+
+
+def _task_running(task: dict | None) -> bool:
+    return bool(task and task.get("status") == "running" and _pid_alive(task.get("pid")))
+
+
+def _task_is_running_locked() -> bool:
+    proc = STATE.get("process")
+    if proc and proc.poll() is None:
+        return True
+    return _task_running(_reconcile_task_locked())
+
+
+def _task_label(task: dict | None) -> str:
+    if not task:
+        return "任务"
+    return TASK_LABELS.get(task.get("kind", ""), task.get("kind") or "任务")
+
+
+def _task_status_text(task: dict | None, kind: str) -> str:
+    if not task:
+        return "空闲"
+    running = _task_running(task)
+    label = _task_label(task)
+    if task.get("kind") != kind:
+        if running:
+            return f"其他任务运行中：{label} · PID {task.get('pid')}"
+        return "空闲"
+    if running:
+        return f"运行中 · {label} · PID {task.get('pid')} · 已运行 {_elapsed_text(task.get('started_at', ''))}"
+    if task.get("status") == "finished":
+        exit_code = task.get("exit_code")
+        return f"已结束 · {label} · 退出码 {exit_code if exit_code is not None else '未知'} · {task.get('finished_at', '')}"
+    return f"{label} · {task.get('status', '未知')}"
+
+
+def _task_statuses(task: dict | None) -> tuple[str, str, str]:
+    return (
+        _task_status_text(task, "h3-generate"),
+        _task_status_text(task, "h3-train"),
+        _task_status_text(task, "train"),
+    )
+
+
+def _task_button_updates(task: dict | None) -> tuple:
+    running = _task_running(task)
+    kind = task.get("kind") if task else None
+    return (
+        gr.update(interactive=not running),
+        gr.update(interactive=running and kind == "h3-generate"),
+        gr.update(interactive=not running),
+        gr.update(interactive=running and kind == "h3-train"),
+        gr.update(interactive=not running),
+        gr.update(interactive=running and kind == "train"),
+    )
+
+
+def poll_task_controls() -> tuple:
+    task = current_task_snapshot()
+    return (*_task_statuses(task), *_task_button_updates(task))
+
+
+def restore_task_ui() -> tuple:
+    task = current_task_snapshot()
+    auto_job = gr.update()
+    auto_summary = gr.update()
+    auto_command = gr.update()
+    h3_dataset = gr.update()
+    h3_lora_path = gr.update()
+    h3_command = gr.update()
+    train_command = gr.update()
+    if task:
+        if task.get("job_dir"):
+            auto_job = gr.update(value=task["job_dir"])
+        if task.get("kind") == "h3-generate":
+            auto_summary = gr.update(value=task.get("summary", ""))
+            auto_command = gr.update(value=task.get("command", ""))
+        if task.get("dataset_dir"):
+            h3_dataset = gr.update(value=task["dataset_dir"])
+        if task.get("output_dir"):
+            h3_lora_path = gr.update(value=task["output_dir"])
+        if task.get("kind") == "h3-train":
+            h3_command = gr.update(value=task.get("command", ""))
+        if task.get("kind") == "train":
+            train_command = gr.update(value=task.get("command", ""))
+    return (
+        *_task_statuses(task),
+        auto_job,
+        auto_summary,
+        auto_command,
+        h3_dataset,
+        h3_lora_path,
+        h3_command,
+        train_command,
+        *_task_button_updates(task),
+    )
+
+
 def _pump_process_log(proc: subprocess.Popen) -> None:
     if proc.stdout is None:
         return
@@ -1105,21 +1270,32 @@ def _pump_process_log(proc: subprocess.Popen) -> None:
     finally:
         proc.stdout.close()
         returncode = proc.wait()
-        logger.info(f"[进程结束] exit={returncode}")
+        with STATE["lock"]:
+            if STATE.get("process") is proc:
+                task = STATE.get("task") or {}
+                task.update(status="finished", exit_code=returncode, finished_at=_now_text())
+                STATE["task"] = task
+                STATE["process"] = None
+                _write_task_state(task)
+                label = _task_label(task)
+            else:
+                label = "任务"
+        logger.info(f"[进程结束] {label} exit={returncode}")
 
 
-def start_training(command: str) -> str:
+def start_training(command: str, task_kind: str = "train", context: dict | None = None) -> str:
     if not command.strip():
         raise gr.Error("请先生成命令")
+    context = context or {}
     with STATE["lock"]:
-        proc = STATE["process"]
-        if proc and proc.poll() is None:
-            raise gr.Error("已有训练任务正在运行")
+        if _task_is_running_locked():
+            raise gr.Error("已有任务正在运行，请先停止或等待结束")
+        label = TASK_LABELS.get(task_kind, task_kind)
         logger.info("=" * 72)
-        logger.info(f"任务启动 {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"任务启动 · {label} · {_now_text()}")
         logger.info(f"$ {command}")
         proc = subprocess.Popen(
-            ["bash", "-lc", command],
+            ["bash", "-c", command],
             cwd=HOME,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1127,27 +1303,52 @@ def start_training(command: str) -> str:
             bufsize=1,
             start_new_session=True,
         )
-        STATE.update(process=proc, log=None)
+        task = {
+            "pid": proc.pid,
+            "kind": task_kind,
+            "label": label,
+            "command": command,
+            "started_at": _now_text(),
+            "finished_at": None,
+            "exit_code": None,
+            "status": "running",
+        }
+        task.update(context)
+        STATE.update(process=proc, log=None, task=task)
+        _write_task_state(task)
         threading.Thread(target=_pump_process_log, args=(proc,), daemon=True).start()
-    return f"已启动，PID {proc.pid}；日志：{LATEST_LOG}"
+    return f"已启动 · {label} · PID {proc.pid}；日志：{LATEST_LOG}"
+
+
+def start_general_training(command: str) -> str:
+    return start_training(command, "train", {"command": command})
 
 
 def stop_training() -> str:
     with STATE["lock"]:
-        proc = STATE["process"]
-        if not proc or proc.poll() is not None:
+        task = _reconcile_task_locked()
+        proc = STATE.get("process")
+        if proc and proc.poll() is None:
+            pid = proc.pid
+        elif _task_running(task):
+            pid = int(task["pid"])
+        else:
             return "当前没有运行中的任务"
-        logger.info(f"发送停止信号 PID {proc.pid}")
-        os.killpg(proc.pid, signal.SIGTERM)
-        return f"已向 PID {proc.pid} 发送停止信号"
+        label = _task_label(task)
+        logger.info(f"发送停止信号 · {label} · PID {pid}")
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return f"PID {pid} 已退出"
+        except PermissionError:
+            return f"没有权限停止 PID {pid}"
+        return f"已向 {label} PID {pid} 发送停止信号"
 
 
 def read_log(limit: int = 250) -> str:
     path = LATEST_LOG
-    status = "未启动/历史日志"
-    proc = STATE["process"]
-    if proc:
-        status = "运行中" if proc.poll() is None else f"已结束（退出码 {proc.returncode}）"
+    task = current_task_snapshot()
+    status = _task_status_text(task, task.get("kind", "")) if task else "未启动/历史日志"
     if not path.exists():
         return status
     try:
@@ -1288,7 +1489,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     auto_command = gr.Textbox(label="自动命令", lines=4)
                 auto_start = gr.Button("生成目标图", variant="primary")
                 with gr.Row():
-                    auto_stop = gr.Button("停止")
+                    auto_stop = gr.Button("停止", interactive=False)
                     auto_log_refresh = gr.Button("刷新日志")
                 auto_status = gr.Textbox(label="生成状态", interactive=False)
                 auto_job_dir = gr.Textbox(label="当前批次目录", interactive=False)
@@ -1353,7 +1554,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     h3_lora_path = gr.Textbox(label="输出目录")
                 h3_start = gr.Button("开始 LoRA 训练", variant="primary")
                 with gr.Row():
-                    h3_stop = gr.Button("停止")
+                    h3_stop = gr.Button("停止", interactive=False)
                     h3_log_refresh = gr.Button("刷新日志")
                     h3_outputs_refresh = gr.Button("刷新输出")
                 h3_status = gr.Textbox(label="训练状态", interactive=False)
@@ -1467,7 +1668,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         generate.click(build_command, [task, data_dir, model_path, component1, component2, component3, output_name, width, height, frames, repeats, epochs, rank, lr, extra], command)
         with gr.Row():
             start = gr.Button("开始训练", variant="primary")
-            stop = gr.Button("停止")
+            stop = gr.Button("停止", interactive=False)
             update_log = gr.Button("刷新日志")
         status = gr.Textbox(label="状态")
         log = gr.Textbox(
@@ -1480,9 +1681,24 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         log_file = gr.DownloadButton("下载完整日志", value=str(LATEST_LOG))
         train_log_timer = gr.Timer(value=2.0, active=True)
         train_log_timer.tick(read_log, outputs=log)
-        start.click(start_training, command, status)
+        start.click(start_general_training, command, status)
         stop.click(stop_training, outputs=status)
         update_log.click(read_log, outputs=log)
+
+    task_state_timer = gr.Timer(value=1.0, active=True)
+    task_state_timer.tick(
+        poll_task_controls,
+        outputs=[auto_status, h3_status, status, auto_start, auto_stop, h3_start, h3_stop, start, stop],
+    )
+    demo.load(
+        restore_task_ui,
+        outputs=[
+            auto_status, h3_status, status,
+            auto_job_dir, auto_summary, auto_command,
+            h3_dataset, h3_lora_path, h3_command, command,
+            auto_start, auto_stop, h3_start, h3_stop, start, stop,
+        ],
+    )
 
 
 if __name__ == "__main__":
