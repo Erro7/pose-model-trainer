@@ -15,7 +15,7 @@ usage() {
 Usage: bash start.sh [--force] [--clean]
 
   --force  Stop this trainer's running WebUI, install and training processes.
-  --clean  --force plus migrate the legacy modelscope-cache into models/ and remove it.
+  --clean  --force plus migrate the legacy modelscope-cache into models/, remove it, and remove empty H3 generation batches.
 EOF
 }
 while [[ $# -gt 0 ]]; do
@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if (( CLEAN )); then
-  bash "${ROOT_DIR}/cleanup.sh" --yes --stop-processes --legacy-cache
+  bash "${ROOT_DIR}/cleanup.sh" --yes --stop-processes --legacy-cache --empty-batches
 elif (( FORCE )); then
   bash "${ROOT_DIR}/cleanup.sh" --yes --stop-processes
 fi

@@ -6,21 +6,24 @@ TRAINER_HOME="${TRAINER_HOME:-/mnt/workspace/pose-model-trainer-data}"
 MODELS_DIR="${DIFFSYNTH_MODEL_BASE_PATH:-${TRAINER_HOME}/models}"
 LEGACY_CACHE="${TRAINER_HOME}/modelscope-cache"
 LOGS_DIR="${TRAINER_HOME}/logs"
+DATASETS_DIR="${TRAINER_HOME}/datasets"
 LOG_MODULE=cleanup
 source "${ROOT_DIR}/shell_log.sh"
 
 APPLY=0
 STOP_PROCESSES=0
 CLEAN_LEGACY=0
+CLEAN_EMPTY_BATCHES=0
 
 usage() {
   cat <<EOF
-Usage: bash cleanup.sh [--yes] [--stop-processes] [--legacy-cache]
+Usage: bash cleanup.sh [--yes] [--stop-processes] [--legacy-cache] [--empty-batches]
 
 Without --yes this is a dry-run.
 
   --stop-processes  Stop this trainer's WebUI, install and training processes.
   --legacy-cache    Migrate missing H3 files into ${MODELS_DIR}, then remove the old ${LEGACY_CACHE}.
+  --empty-batches   Remove h3-auto-targets-* jobs that contain no target images and no metadata.json.
 EOF
 }
 
@@ -29,19 +32,17 @@ while [[ $# -gt 0 ]]; do
     --yes) APPLY=1 ;;
     --stop-processes) STOP_PROCESSES=1 ;;
     --legacy-cache) CLEAN_LEGACY=1 ;;
+    --empty-batches) CLEAN_EMPTY_BATCHES=1 ;;
     -h|--help) usage; exit 0 ;;
     *) log_error "unknown option: $1"; usage >&2; exit 2 ;;
   esac
   shift
 done
 
-patterns=(
-  "${ROOT_DIR}/app.py"
+workload_patterns=(
   "${ROOT_DIR}/ensure_h3_runtime.py"
   "${ROOT_DIR}/download_h3.py"
   "${ROOT_DIR}/generate_h3_targets.py"
-  "${ROOT_DIR}/.venv/bin/python -m pip"
-  "${ROOT_DIR}/.venv-h3/bin/python -m pip"
   "${TRAINER_HOME}/repos/DiffSynth-Studio/examples/minimax_h3_image/model_training/train.py"
   "${TRAINER_HOME}/repos/sd-scripts/sdxl_train_network.py"
   "${TRAINER_HOME}/repos/sd-scripts/flux_train_network.py"
@@ -53,6 +54,12 @@ patterns=(
   "git.*${TRAINER_HOME}/repos/sd-scripts"
   "git.*${TRAINER_HOME}/repos/musubi-tuner"
 )
+patterns=(
+  "${ROOT_DIR}/app.py"
+  "${ROOT_DIR}/.venv/bin/python -m pip"
+  "${ROOT_DIR}/.venv-h3/bin/python -m pip"
+  "${workload_patterns[@]}"
+)
 
 processes_running() {
   local pattern
@@ -62,6 +69,67 @@ processes_running() {
     fi
   done
   return 1
+}
+
+workload_running() {
+  local pattern
+  for pattern in "${workload_patterns[@]}"; do
+    if pgrep -f -- "$pattern" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+active_h3_job() {
+  local state_file="${LOGS_DIR}/task-state.json"
+  [[ -f "${state_file}" ]] || return 0
+  python3 - "${state_file}" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        task = json.load(handle)
+except (OSError, ValueError, TypeError):
+    raise SystemExit(0)
+
+if task.get("status") in {"running", "paused"} and task.get("kind") in {"h3-generate", "h3-train"}:
+    print(task.get("job_dir") or task.get("dataset_dir") or "")
+PY
+}
+
+clean_empty_batches() {
+  local active_job batch target_count size removed=0
+  active_job="$(active_h3_job)"
+  for batch in "${DATASETS_DIR}"/h3-auto-targets-*; do
+    [[ -d "${batch}" ]] || continue
+    if [[ -n "${active_job}" && "$(readlink -f -- "${batch}")" == "$(readlink -f -- "${active_job}")" ]]; then
+      log_info "keep active generation batch ${batch}"
+      continue
+    fi
+    [[ -f "${batch}/metadata.json" ]] && continue
+    target_count=0
+    if [[ -d "${batch}/targets" ]]; then
+      target_count="$(find "${batch}/targets" -type f | wc -l)"
+    fi
+    (( target_count == 0 )) || continue
+    size="$(du -sh "${batch}" 2>/dev/null | awk '{print $1}' || true)"
+    if (( APPLY )); then
+      log_info "removing empty batch ${batch} (${size:-unknown})"
+      rm -rf -- "${batch}"
+    else
+      log_info "would remove empty batch ${batch} (${size:-unknown})"
+    fi
+    ((removed += 1))
+  done
+  if (( removed == 0 )); then
+    log_info "no empty H3 generation batches found in ${DATASETS_DIR}"
+  elif (( APPLY )); then
+    log_info "removed ${removed} empty H3 generation batches"
+  else
+    log_info "dry-run: ${removed} empty H3 generation batches would be removed"
+  fi
 }
 
 stop_processes() {
@@ -179,6 +247,15 @@ if (( CLEAN_LEGACY )); then
     else
       log_warn "skip legacy cache: required models are not complete in ${MODELS_DIR}"
     fi
+  fi
+fi
+
+if (( CLEAN_EMPTY_BATCHES )); then
+  active_job="$(active_h3_job)"
+  if workload_running && [[ -z "${active_job}" ]] && (( ! STOP_PROCESSES )); then
+    log_warn "skip empty batch cleanup while generation or training is running; add --stop-processes"
+  else
+    clean_empty_batches
   fi
 fi
 

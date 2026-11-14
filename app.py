@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 import zipfile
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 try:
@@ -102,6 +102,9 @@ INSTALL_LOG = LOGS / "install-backends.log"
 INSTALL_STATE = {"running": False, "step": "尚未开始", "returncode": None, "lock": threading.Lock()}
 
 CUSTOM_GENERATION_SIZE = "自定义尺寸（高级）"
+PERSON_MODE_BALANCED = "多人均分随机（推荐）"
+PERSON_MODE_MULTI_REF = "同一人物多图参考"
+PERSON_MODES = (PERSON_MODE_BALANCED, PERSON_MODE_MULTI_REF)
 COMMON_GENERATION_SIZES = (
     (512, 512, "1:1"),
     (512, 768, "2:3"),
@@ -293,6 +296,24 @@ def py() -> str:
 
 def accelerate() -> str:
     return f"{py()} -m accelerate.commands.launch"
+
+
+def h3_accelerate() -> str:
+    return (
+        f"{accelerate()} --num_processes 1 --num_machines 1 "
+        "--mixed_precision no --dynamo_backend no"
+    )
+
+
+def h3_gpu_lock_command(command: str) -> str:
+    lock = LOGS / "h3-gpu.lock"
+    return (
+        f"mkdir -p {q(lock.parent)} && "
+        f"flock -n -E 75 {q(lock)} bash -c {q(command)} || "
+        "{ rc=$?; if [ \"$rc\" -eq 75 ]; then "
+        "echo '[h3] 已有 H3 GPU 任务正在运行，请等待当前任务结束' >&2; "
+        "fi; exit \"$rc\"; }"
+    )
 
 
 def _tree_bytes(paths: list[Path]) -> int:
@@ -864,11 +885,100 @@ def prepare_h3_character_dataset(
     return str(root), summary
 
 
-def prepare_h3_generation_job(people, outfits, poses, portrait_keyword, keyword, costume_keyword, max_items, safe_only, job_name, instruction):
+def balanced_people_assignments(people: list[Path], count: int, seed: int) -> list[Path]:
+    if not people or count <= 0:
+        return []
+    rng = random.Random(int(seed))
+    base, remainder = divmod(count, len(people))
+    assignments = [person for person in people for _ in range(base)]
+    if remainder:
+        assignments.extend(rng.sample(people, remainder))
+    rng.shuffle(assignments)
+    return assignments
+
+
+def parse_keywords(raw: str) -> list[str]:
+    terms = [term.strip().lower() for term in re.split(r"[,，;；|\n]+", raw or "")]
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def matches_keywords(searchable: str, keywords: list[str]) -> bool:
+    return not keywords or any(keyword in searchable for keyword in keywords)
+
+
+BODY_PROPORTION_MARKERS = (
+    "全身", "身材", "体型", "体态", "身体比例", "肢体比例", "骨骼", "身高", "腿长", "腿型",
+    "full body", "body proportion", "body type", "skeleton", "height", "leg length",
+)
+ASIAN_FEMALE_ANATOMY_GUIDANCE = (
+    "a healthy natural adult East Asian female build: balanced head-to-body relationships, "
+    "moderate shoulder width, a soft natural waist-to-hip curve, proportionate torso and limbs, "
+    "realistic joint placement, hands and feet, without exaggerated runway-model elongation."
+)
+NO_TEXT_GUIDANCE = (
+    "The output must be a clean photograph with no text of any kind: no captions, titles, labels, "
+    "letters, numbers, logos, signatures, watermarks, UI overlays, borders or typography. "
+    "Do not transcribe or visualize any description, metadata or prompt wording."
+)
+POSE_ONLY_GUIDANCE = (
+    "Use the pose reference only for joint placement, limb positioning and camera angle. "
+    "Do not copy or infer body shape or proportions from the pose reference. "
+    "Do not copy its identity, face, hairstyle, skin tone or clothing."
+)
+
+
+def portrait_has_body_proportions(item: dict | None) -> bool | None:
+    if not item:
+        return None
+    searchable = " ".join(str(value) for value in item.values()).lower()
+    return any(marker.lower() in searchable for marker in BODY_PROPORTION_MARKERS)
+
+
+def build_h3_generation_prompt(
+    person_range: str, outfit_range: str, pose_number: int,
+    body_proportions: bool | None, instruction: str,
+) -> str:
+    if body_proportions is False:
+        body_guidance = (
+            "Preserve the identity, face and hairstyle from the person reference. "
+            "Do not infer body proportions from the person reference or the pose reference. "
+            f"Construct the body as {ASIAN_FEMALE_ANATOMY_GUIDANCE}"
+        )
+    elif body_proportions is True:
+        body_guidance = (
+            f"Preserve the identity, face, hairstyle and recognizable body type from {person_range}. "
+            "Keep clearly visible body proportions consistent with that person, but harmonize them into "
+            f"{ASIAN_FEMALE_ANATOMY_GUIDANCE} "
+            "Body proportions must remain independent of the pose reference."
+        )
+    else:
+        body_guidance = (
+            f"Preserve the identity, face, hairstyle and any recognizable body type from {person_range}. "
+            "Preserve any clearly visible body cues from that person, but harmonize them into "
+            f"{ASIAN_FEMALE_ANATOMY_GUIDANCE} "
+            "If the body is not visible, construct it directly; body proportions must remain independent of the pose reference."
+        )
+    parts = [
+        ("A photorealistic full-body fashion photograph of an adult East Asian woman." if body_proportions is False else "A photorealistic full-body fashion photograph."),
+        body_guidance,
+        f"Dress the same person using only the garment design, colors, materials and accessories shown in {outfit_range}.",
+        f"Reproduce the exact body pose, limb placement and camera angle shown in <Picture {pose_number}>. {POSE_ONLY_GUIDANCE}",
+        "Natural lighting, realistic skin and fabric, clean background.",
+    ]
+    if (instruction or "").strip():
+        parts.append(instruction.strip())
+    parts.append(NO_TEXT_GUIDANCE)
+    return " ".join(parts)
+
+
+def prepare_h3_generation_job(
+    people, outfits, poses, person_mode, portrait_keyword, keyword, costume_keyword,
+    max_items, safe_only, job_name, instruction, seed,
+):
     people_files = _upload_paths(people)
     outfit_files = _upload_paths(outfits)
     pose_files = _upload_paths(poses)
-    needle = (keyword or "").strip().lower()
+    pose_keywords = parse_keywords(keyword)
     gallery_cache: Path | None = None
 
     def gallery() -> Path:
@@ -882,11 +992,11 @@ def prepare_h3_generation_job(people, outfits, poses, portrait_keyword, keyword,
         portrait_index = gallery() / "data/portrait-zh.json"
         if not portrait_index.is_file():
             raise gr.Error("Pose 仓库缺少 data/portrait-zh.json，请重新同步完整图库")
-        portrait_needle = (portrait_keyword or "").strip().lower()
+        portrait_keywords = parse_keywords(portrait_keyword)
         portraits = []
         for item in json.loads(portrait_index.read_text(encoding="utf-8")):
             searchable = " ".join(str(item.get(k, "")) for k in ("id", "分区", "发长", "发型名称", "标题", "检索"))
-            if portrait_needle and portrait_needle not in searchable.lower():
+            if not matches_keywords(searchable.lower(), portrait_keywords):
                 continue
             source = gallery() / item.get("原图", "")
             if source.is_file():
@@ -910,7 +1020,7 @@ def prepare_h3_generation_job(people, outfits, poses, portrait_keyword, keyword,
         selected = []
         for item in json.loads(index.read_text(encoding="utf-8")):
             searchable = " ".join(str(item.get(k, "")) for k in ("体系", "分类", "姿势名称", "角度", "检索"))
-            if needle and needle not in searchable.lower():
+            if not matches_keywords(searchable.lower(), pose_keywords):
                 continue
             if safe_only and any(word in searchable for word in ("性感", "双人缠绵")):
                 continue
@@ -926,10 +1036,10 @@ def prepare_h3_generation_job(people, outfits, poses, portrait_keyword, keyword,
         costume_index = gallery() / "data/costume-zh.json"
         if not costume_index.is_file():
             raise gr.Error("Pose 仓库缺少 data/costume-zh.json，请重新同步图库")
-        costume_needle = (costume_keyword or "").strip().lower()
+        costume_keywords = parse_keywords(costume_keyword)
         for item in json.loads(costume_index.read_text(encoding="utf-8")):
             searchable = " ".join(str(item.get(k, "")) for k in ("分类", "服装名称", "标签", "关键词", "检索"))
-            if costume_needle and costume_needle not in searchable.lower():
+            if not matches_keywords(searchable.lower(), costume_keywords):
                 continue
             if safe_only and any(word in searchable for word in ("内衣", "性感", "泳装")):
                 continue
@@ -942,10 +1052,24 @@ def prepare_h3_generation_job(people, outfits, poses, portrait_keyword, keyword,
     root = _new_dataset_root(safe_name)
     refs = root / "references"
     refs.mkdir()
-    person_names = [f"references/{_copy_named(path, refs, 'person', i)}" for i, path in enumerate(people_files, 1)]
+    person_names_by_source = {}
+    person_ids = {}
+    person_titles = {}
+    for index, path in enumerate(people_files, 1):
+        person_names_by_source[path] = f"references/{_copy_named(path, refs, 'person', index)}"
+        person_ids[path] = f"uploaded-person-{index}"
+        person_titles[path] = path.stem or f"person {index}"
+    balanced_people = person_mode != PERSON_MODE_MULTI_REF and len(people_files) > 1
+    if balanced_people:
+        person_assignments = balanced_people_assignments(people_files, len(selected), int(seed))
+    else:
+        person_assignments = [list(people_files) for _ in selected]
+    portrait_body_proportions = portrait_has_body_proportions(portrait_item)
     uploaded_outfit_names = [f"references/{_copy_named(path, refs, 'outfit', i)}" for i, path in enumerate(outfit_files, 1)]
     manifest = []
     for i, (pose_item, pose_path) in enumerate(selected, 1):
+        assigned_people = [person_assignments[i - 1]] if balanced_people else person_assignments[i - 1]
+        person_names = [person_names_by_source[path] for path in assigned_people]
         if uploaded_outfit_names:
             outfit_names = uploaded_outfit_names
             costume_item = {"id": "uploaded", "服装名称": "the uploaded outfit", "关键词": ""}
@@ -958,30 +1082,55 @@ def prepare_h3_generation_job(people, outfits, poses, portrait_keyword, keyword,
         outfit_start = len(person_names) + 1
         outfit_range = f"<Picture {outfit_start}>" if len(outfit_names) == 1 else f"<Picture {outfit_start}>-<Picture {outfit_start + len(outfit_names) - 1}>"
         pose_number = len(all_refs)
-        pose_text = f"{pose_item.get('体系', '')}, {pose_item.get('分类', '')}, {pose_item.get('姿势名称', '')}, camera angle: {pose_item.get('角度', '')}"
-        costume_text = f"{costume_item.get('服装名称', '')}; {costume_item.get('关键词', '')}"
-        prompt = (
-            f"Preserve the identity, face, hairstyle and body proportions from {person_range}. "
-            f"Dress the same person in the clothing from {outfit_range}. "
-            f"Match the body pose, limb placement and camera viewpoint in <Picture {pose_number}> exactly. "
-            f"Outfit description: {costume_text}. Pose description: {pose_text}. {instruction.strip()}"
+        prompt = build_h3_generation_prompt(
+            person_range, outfit_range, pose_number,
+            portrait_body_proportions, instruction,
         )
+        if portrait_item:
+            portrait_id = portrait_item.get("id", "")
+            portrait_title = portrait_item.get("标题", "")
+            portrait_mode = "gallery-random"
+        elif balanced_people:
+            selected_person = assigned_people[0]
+            portrait_id = person_ids[selected_person]
+            portrait_title = person_titles[selected_person]
+            portrait_mode = PERSON_MODE_BALANCED
+        else:
+            portrait_id = "uploaded-person-pool"
+            portrait_title = f"uploaded person pool ({len(people_files)} refs)"
+            portrait_mode = PERSON_MODE_MULTI_REF
         manifest.append({
             "output": f"target_{i:04d}.png", "pose_id": pose_item.get("id", ""),
             "pose_name": pose_item.get("姿势名称", ""), "costume_id": costume_item.get("id", ""),
             "costume_name": costume_item.get("服装名称", ""),
-            "portrait_id": portrait_item.get("id", "") if portrait_item else "uploaded",
-            "portrait_title": portrait_item.get("标题", "") if portrait_item else "uploaded",
+            "portrait_id": portrait_id, "portrait_title": portrait_title,
+            "portrait_mode": portrait_mode, "selection_seed": int(seed),
+            "portrait_body_proportions": portrait_body_proportions,
             "prompt": prompt, "edit_image": all_refs,
         })
     (root / "generation.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    person_source = "上传人物" if portrait_item is None else f"仓库随机人物：{portrait_item.get('id', '')} · {portrait_item.get('标题', '')}"
+    if portrait_item:
+        person_source = f"仓库随机人物：{portrait_item.get('id', '')} · {portrait_item.get('标题', '')}"
+    elif balanced_people:
+        counts = Counter(person_assignments)
+        distribution = "；".join(
+            f"{person_titles[person]} ×{counts[person]}" for person in people_files if counts[person]
+        )
+        person_source = f"上传人物池 {len(people_files)} 人 · 均分随机 · {distribution}"
+    else:
+        person_source = f"上传人物 · {len(people_files)} 张同一人物参考"
     outfit_source = "上传的服装参考" if outfit_files else "仓库服装库"
     pose_source = "上传的 Pose 参考" if pose_files else "仓库 Pose 库"
+    if portrait_body_proportions is False:
+        proportion_source = "人物参考不提供身材比例；使用自然的亚洲女性比例，Pose 仅控制姿势"
+    elif portrait_body_proportions is None:
+        proportion_source = "人物参考仅保留身份和可见特征；比例收敛为自然的亚洲女性比例，Pose 仅控制姿势"
+    else:
+        proportion_source = "以人物参考的可见体型比例为准并收敛为自然的亚洲女性比例；Pose 仅控制姿势"
     return str(root), (
         f"已构造 {len(manifest)} 个生成任务。\n人物：{person_source}\n"
-        f"服装：{outfit_source}\nPose：{pose_source}\n"
-        "同一批次固定同一人物，提示词由人物、服装与 Pose 字段自动组合。"
+        f"服装：{outfit_source}\nPose：{pose_source}\n身材与比例：{proportion_source}\n"
+        "提示词由人物、服装与 Pose 字段自动组合；人物分配记录在 generation.json。"
     )
 
 
@@ -994,14 +1143,15 @@ def build_h3_generation_command(job_dir, width, height, seed):
     ensure = f"{py()} {q(ROOT / 'ensure_h3_runtime.py')}"
     download = f"{py()} {q(ROOT / 'download_h3.py')} --profile quantized --models-dir {q(model_dir)}"
     generate = f"{py()} {q(ROOT / 'generate_h3_targets.py')} --job {q(job)} --width {int(width)} --height {int(height)} --seed {int(seed)}"
-    return (
+    command = (
         f"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
         f"{ensure} && {download} && DIFFSYNTH_SKIP_DOWNLOAD=1 {generate}"
     )
+    return h3_gpu_lock_command(command)
 
 
 def start_h3_generation(
-    people, outfits, poses, portrait_keyword, pose_keyword, costume_keyword,
+    people, outfits, poses, person_mode, portrait_keyword, pose_keyword, costume_keyword,
     max_items, safe_only, job_name, instruction, size_choice, width, height, seed,
 ):
     gpu_error = h3_gpu_support_error()
@@ -1009,8 +1159,8 @@ def start_h3_generation(
         raise gr.Error(gpu_error)
     width, height = resolve_generation_size(size_choice, width, height)
     job_dir, summary = prepare_h3_generation_job(
-        people, outfits, poses, portrait_keyword, pose_keyword, costume_keyword,
-        max_items, safe_only, job_name, instruction,
+        people, outfits, poses, person_mode, portrait_keyword, pose_keyword, costume_keyword,
+        max_items, safe_only, job_name, instruction, seed,
     )
     command = build_h3_generation_command(job_dir, width, height, seed)
     summary = f"{summary}\n画面尺寸：{width} × {height}"
@@ -1037,13 +1187,117 @@ def start_h3_lora(
     return command, output_dir, status
 
 
-def refresh_generated_targets(job_dir):
-    job = Path(job_dir).expanduser().resolve()
+def _review_target_entries(job: Path) -> list[tuple[int, Path, dict]]:
     manifest_file = job / "generation.json"
-    if not manifest_file.is_file():
-        return []
-    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-    return [(str(job / "targets" / item["output"]), f"{item.get('costume_id', '')} · {item['pose_id']} · {item['pose_name']}") for item in manifest if (job / "targets" / item["output"]).is_file()]
+    if manifest_file.is_file():
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise gr.Error(f"generation.json 读取失败：{exc}") from exc
+        entries = []
+        for number, item in enumerate(manifest, 1):
+            target = job / "targets" / str(item.get("output", ""))
+            if target.is_file():
+                entries.append((number, target, item))
+        return entries
+    return [(number, target, {}) for number, target in enumerate(_job_target_files(job), 1)]
+
+
+def _format_number_set(numbers: set[int]) -> str:
+    values = sorted(number for number in numbers if number > 0)
+    parts: list[str] = []
+    index = 0
+    while index < len(values):
+        start = end = values[index]
+        while index + 1 < len(values) and values[index + 1] == end + 1:
+            index += 1
+            end = values[index]
+        if start == end:
+            parts.append(str(start))
+        elif end - start == 1:
+            parts.append(f"{start},{end}")
+        else:
+            parts.append(f"{start}-{end}")
+        index += 1
+    return ",".join(parts)
+
+
+def _render_generation_review(job_dir, exclusions="") -> tuple[list[tuple[str, str]], str]:
+    if not str(job_dir or "").strip():
+        return [], "请先生成目标图，或从成果库载入一个批次。"
+    job = Path(job_dir).expanduser().resolve()
+    entries = _review_target_entries(job)
+    if not entries:
+        return [], "当前批次还没有可预览的目标图；先完成生成，或从成果库载入一个批次。"
+    excluded = _number_set(exclusions) & {number for number, _, _ in entries}
+    gallery = []
+    for number, path, item in entries:
+        details = " · ".join(
+            part for part in (
+                str(item.get("portrait_title") or item.get("portrait_id") or ""),
+                str(item.get("costume_id") or ""),
+                str(item.get("pose_id") or ""),
+                str(item.get("pose_name") or ""),
+            ) if part
+        )
+        caption = f"#{number:04d}"
+        if number in excluded:
+            caption = f"{caption} · 已排除"
+        if details:
+            caption = f"{caption} · {details}"
+        gallery.append((str(path), caption))
+    retained = len(entries) - len(excluded)
+    status = (
+        f"候选图 {len(entries)} 张 · 已排除 {len(excluded)} 张 · 将保留 {retained} 张。"
+        "点选图片后可用“排除选中/恢复选中”操作；也可以直接修改排除序号。"
+    )
+    return gallery, status
+
+
+def refresh_generated_targets(job_dir, exclusions=""):
+    gallery, status = _render_generation_review(job_dir, exclusions)
+    return gallery, None, status
+
+
+def select_review_target(job_dir, exclusions, evt: gr.SelectData):
+    entries = _review_target_entries(Path(job_dir).expanduser().resolve())
+    if not isinstance(evt.index, int) or not 0 <= evt.index < len(entries):
+        return None, "没有识别到选中的候选图，请刷新后重试。"
+    number = entries[evt.index][0]
+    state = "已排除" if number in _number_set(exclusions) else "保留"
+    return number, f"已选中 #{number:04d} · 当前状态：{state}。点击下方按钮排除或恢复。"
+
+
+def _set_selected_target_excluded(job_dir, exclusions, selected_number, exclude: bool):
+    if selected_number is None:
+        raise gr.Error("请先在候选图中点选一张图片")
+    numbers = _number_set(exclusions)
+    if exclude:
+        numbers.add(int(selected_number))
+    else:
+        numbers.discard(int(selected_number))
+    formatted = _format_number_set(numbers)
+    gallery, status = _render_generation_review(job_dir, formatted)
+    action = "已排除" if exclude else "已恢复"
+    return gallery, formatted, int(selected_number), f"{action} #{int(selected_number):04d}。\n{status}"
+
+
+def exclude_selected_target(job_dir, exclusions, selected_number):
+    return _set_selected_target_excluded(job_dir, exclusions, selected_number, True)
+
+
+def restore_selected_target(job_dir, exclusions, selected_number):
+    return _set_selected_target_excluded(job_dir, exclusions, selected_number, False)
+
+
+def clear_review_exclusions(job_dir):
+    gallery, status = _render_generation_review(job_dir, "")
+    return gallery, "", None, status
+
+
+def apply_review_exclusions(job_dir, exclusions):
+    gallery, status = _render_generation_review(job_dir, exclusions)
+    return gallery, None, status
 
 
 def _number_set(raw: str) -> set[int]:
@@ -1072,16 +1326,25 @@ def finalize_generated_dataset(job_dir, trigger_word, exclusions, refined_target
             target = job / "targets" / manifest[index - 1]["output"]
             target.parent.mkdir(exist_ok=True)
             shutil.copy2(source, target)
-    excluded, records = _number_set(exclusions), []
+    excluded, excluded_numbers, records = _number_set(exclusions), [], []
     for index, item in enumerate(manifest, 1):
         target = job / "targets" / item["output"]
-        if target.is_file() and index not in excluded:
+        if not target.is_file():
+            continue
+        if index in excluded:
+            excluded_numbers.append(index)
+        else:
             records.append({"image": f"targets/{item['output']}", "prompt": " ".join((trigger_word.strip(), item["prompt"])), "edit_image": item["edit_image"]})
     if not records:
         raise gr.Error("还没有可用的生成目标图")
     metadata = job / "metadata.json"
     metadata.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-    return str(job), f"已应用 {len(refined)} 张顺序精修图，排除 {len(excluded)} 个序号，保留 {len(records)} 张并重建 metadata.json。"
+    excluded_text = _format_number_set(set(excluded_numbers)) or "无"
+    message = (
+        f"已应用 {len(refined)} 张顺序精修图，排除 {len(excluded_numbers)} 张（{excluded_text}），"
+        f"保留 {len(records)} 张并重建 metadata.json。"
+    )
+    return str(job), message
 
 
 def build_h3_character_command(dataset_dir, output_name, model_profile, repeats, epochs, rank, lr, max_pixels, adapter_path, low_vram):
@@ -1132,7 +1395,7 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
             "DiffSynth-Studio/MiniMax-H3-Image-EntroPack:models/vae_int8.safetensors"
         )
         train = (
-            f"{accelerate()} {q(script)} --dataset_base_path {q(dataset)} "
+            f"{h3_accelerate()} {q(script)} --dataset_base_path {q(dataset)} "
             f"--dataset_metadata_path {q(metadata)} --dataset_repeat {int(repeats)} "
             f"--num_epochs {int(epochs)} --model_id_with_origin_paths {q(quant_models)} "
             f"{common_tail} --output_path {q(lora_dir)} --dataset_num_workers 4 --find_unused_parameters"
@@ -1145,16 +1408,16 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
             f"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
             f"{ensure} && {download} && export DIFFSYNTH_SKIP_DOWNLOAD=1 && {train}"
         )
-        return command, str(lora_dir)
+        return h3_gpu_lock_command(command), str(lora_dir)
     common = f"{common_tail} --model_id_with_origin_paths {q(bf16_models)}"
     stage1 = (
-        f"{accelerate()} {q(script)} --dataset_base_path {q(dataset)} "
+        f"{h3_accelerate()} {q(script)} --dataset_base_path {q(dataset)} "
         f"--dataset_metadata_path {q(metadata)} --dataset_repeat 1 --num_epochs 1 {common} "
         f"--output_path {q(cache_dir)} --task sft:data_process "
         f"--offload_models {q('MiniMax/MiniMax-H3-Image:transformer/model*.safetensors,MiniMax/MiniMax-H3-Image:pdd_fused_heads.safetensors')}"
     )
     stage2 = (
-        f"{accelerate()} {q(script)} --dataset_base_path {q(cache_dir)} "
+        f"{h3_accelerate()} {q(script)} --dataset_base_path {q(cache_dir)} "
         f"--dataset_repeat {int(repeats)} --num_epochs {int(epochs)} {common} "
         f"--output_path {q(lora_dir)} --task sft:train "
         f"--offload_models {q('MiniMax/MiniMax-H3:FL2VA/text_encoder/model*.safetensors,MiniMax/MiniMax-H3-Image:vae/diffusion_pytorch_model.safetensors')}"
@@ -1167,7 +1430,7 @@ def build_h3_character_command(dataset_dir, output_name, model_profile, repeats,
         f"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MODELSCOPE_CACHE={q(model_cache)} DIFFSYNTH_MODEL_BASE_PATH={q(model_dir)} && "
         f"{ensure} && {download} && export DIFFSYNTH_SKIP_DOWNLOAD=1 && {stage1} && {stage2}"
     )
-    return command, str(lora_dir)
+    return h3_gpu_lock_command(command), str(lora_dir)
 
 
 def write_dataset_config(kind: str, data_dir: str, width: int, height: int, frames: int, repeats: int) -> Path:
@@ -1323,6 +1586,13 @@ def _task_label(task: dict | None) -> str:
     return TASK_LABELS.get(task.get("kind", ""), task.get("kind") or "任务")
 
 
+def _exit_signal_name(exit_code: int) -> str:
+    try:
+        return signal.Signals(-exit_code).name
+    except ValueError:
+        return f"信号 {-exit_code}"
+
+
 def _task_status_text(task: dict | None, kind: str) -> str:
     if not task:
         return "空闲"
@@ -1343,6 +1613,9 @@ def _task_status_text(task: dict | None, kind: str) -> str:
         return f"运行中 · {label} · PID {task.get('pid')} · 已运行 {_elapsed_text(task.get('started_at', ''))}"
     if task.get("status") == "finished":
         exit_code = task.get("exit_code")
+        if isinstance(exit_code, int) and exit_code < 0:
+            signal_name = task.get("exit_signal") or _exit_signal_name(exit_code)
+            return f"已结束 · {label} · 被 {signal_name} 终止 · {task.get('finished_at', '')}"
         return f"已结束 · {label} · 退出码 {exit_code if exit_code is not None else '未知'} · {task.get('finished_at', '')}"
     return f"{label} · {task.get('status', '未知')}"
 
@@ -1429,17 +1702,26 @@ def _pump_process_log(proc: subprocess.Popen) -> None:
     finally:
         proc.stdout.close()
         returncode = proc.wait()
+        exit_signal = None
+        if returncode < 0:
+            exit_signal = _exit_signal_name(returncode)
         with STATE["lock"]:
             if STATE.get("process") is proc:
                 task = STATE.get("task") or {}
-                task.update(status="finished", exit_code=returncode, finished_at=_now_text())
+                task.update(
+                    status="finished", exit_code=returncode, exit_signal=exit_signal,
+                    finished_at=_now_text(),
+                )
                 STATE["task"] = task
                 STATE["process"] = None
                 _write_task_state(task)
                 label = _task_label(task)
             else:
                 label = "任务"
-        logger.info(f"[进程结束] {label} exit={returncode}")
+        if exit_signal:
+            logger.warning(f"[进程结束] {label} signal={exit_signal} exit={returncode}")
+        else:
+            logger.info(f"[进程结束] {label} exit={returncode}")
 
 
 def start_training(command: str, task_kind: str = "train", context: dict | None = None) -> str:
@@ -1680,9 +1962,12 @@ def load_artifact_preview(job_dirs):
 def use_artifact_for_review(job_dirs):
     jobs = _selected_artifact_jobs(job_dirs)
     job = jobs[0]
-    gallery, _ = preview_artifact_jobs([str(job)])
+    gallery, review_status = _render_generation_review(str(job), "")
     extra = f"；另有 {len(jobs) - 1} 个批次未载入" if len(jobs) > 1 else ""
-    return str(job), gallery, f"已把 {job.name} 载入“2 · 筛选整理”{extra}。"
+    return (
+        str(job), gallery, "", None, review_status,
+        f"已把 {job.name} 载入“2 · 筛选整理”{extra}。",
+    )
 
 
 def use_artifact_as_dataset(job_dirs, trigger_word: str):
@@ -1827,19 +2112,31 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         )
         with gr.Tabs():
             with gr.Tab("1 · 生成目标图"):
-                gr.Markdown("默认从完整图库随机选择一位人物，并自动搭配服装与 Pose；同一批次保持人物一致。")
+                gr.Markdown(
+                    "默认从完整图库随机选择一位人物，并自动搭配服装与 Pose；上传多个人物并选择“多人均分随机”时，"
+                    "人物会按任务分配，不再固定为同一人。"
+                )
+                gr.Markdown(
+                    "人物、Pose 和服装范围均支持多个关键词：用英文逗号、中文逗号、分号、竖线或换行分隔，"
+                    "任一关键词命中即可；留空时按对应图库的默认规则选择。"
+                )
+                gr.Markdown(
+                    "内置人像库只提供面部与发型参考，不含可靠肢体比例。提示词会明确要求生成协调的成年女性化身体结构；"
+                    "上传带全身比例的人物素材时会优先保留其中明确可见的比例。服装与 Pose 只通过参考图传递，"
+                    "不再把中文元数据拼进正文，并强制禁止字幕、标签、水印和排版文字。"
+                )
                 with gr.Row():
                     auto_portrait_keyword = gr.Textbox(
-                        label="人物范围（可选）",
-                        placeholder="短发、长发、正脸参考；留空全库随机",
+                        label="人物范围（可多个关键词）",
+                        placeholder="短发，长发，正脸参考；留空全库随机",
                     )
                     auto_pose_keyword = gr.Textbox(
-                        label="Pose 范围（可选）",
-                        placeholder="站姿、坐姿、侧面；留空按图库顺序",
+                        label="Pose 范围（可多个关键词）",
+                        placeholder="站姿，坐姿，侧面；留空按图库顺序",
                     )
                     auto_costume_keyword = gr.Textbox(
-                        label="服装范围（可选）",
-                        placeholder="春季、礼服；留空按图库顺序",
+                        label="服装范围（可多个关键词）",
+                        placeholder="春季，礼服；留空按图库顺序",
                     )
                     auto_pose_count = gr.Number(
                         value=4, minimum=1, maximum=200, precision=0,
@@ -1878,6 +2175,12 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                         auto_people = gr.Files(label="自定义人物（可选）", file_types=["image"])
                         auto_outfits = gr.Files(label="自定义服装（可选）", file_types=["image"])
                         auto_poses = gr.Files(label="自定义 Pose（可选）", file_types=["image"])
+                    auto_person_mode = gr.Dropdown(
+                        choices=list(PERSON_MODES),
+                        value=PERSON_MODE_BALANCED,
+                        label="多张自定义人物的分配方式",
+                        info="均分随机会按生成数量尽量平均分配每人，并用 Seed 固定结果；同一人物多图参考会把所有人物图同时送入每张任务",
+                    )
                 with gr.Accordion("自定义尺寸与任务参数（高级）", open=False):
                     gr.Markdown("常用尺寸会自动带入；只有选择“自定义尺寸（高级）”时才使用下面宽高。宽高需为 16 的倍数且不能超过安全预算。")
                     with gr.Row():
@@ -1904,17 +2207,28 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                 auto_log_file = gr.DownloadButton("下载完整日志", value=str(LATEST_LOG))
 
             with gr.Tab("2 · 筛选整理"):
-                gr.Markdown("刷新候选图，排除失败结果；也可以上传精修图，按顺序替换前 N 张。")
-                auto_refresh = gr.Button("刷新候选图片", variant="primary")
+                gr.Markdown(
+                    "预览标题以 `#0001` 格式显示原任务序号。点选图片后可直接排除或恢复；"
+                    "也可以手填序号或范围。上传精修图时仍按顺序替换前 N 张。"
+                )
+                with gr.Row():
+                    auto_refresh = gr.Button("刷新候选图", variant="primary")
+                    auto_apply_exclusions = gr.Button("应用排除序号")
+                    auto_clear_exclusions = gr.Button("清空排除")
+                auto_selected_target = gr.State(None)
                 auto_gallery = gr.Gallery(
-                    label="候选目标图",
-                    columns=4,
+                    label="候选目标图（点击选择）",
+                    columns=5,
                     height="auto",
                 )
                 with gr.Row():
+                    auto_exclude_selected = gr.Button("排除选中")
+                    auto_restore_selected = gr.Button("恢复选中")
+                auto_review_status = gr.Textbox(label="筛选状态", lines=2, interactive=False)
+                with gr.Row():
                     auto_exclusions = gr.Textbox(
-                        label="排除序号",
-                        placeholder="例如 2,5-7",
+                        label="排除序号（支持范围）",
+                        placeholder="例如：2,5-7；点选图片时会自动回填",
                     )
                     auto_refined = gr.Files(
                         label="精修替换图（可选）",
@@ -1924,7 +2238,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     auto_trigger = gr.Textbox(value="ohwx person", label="人物触发词")
                     auto_finalize = gr.Button("确认并创建训练集", variant="primary")
                 h3_dataset = gr.Textbox(label="训练数据集目录", interactive=False)
-                auto_finalize_summary = gr.Textbox(label="整理结果", lines=3, interactive=False)
+                auto_finalize_summary = gr.Textbox(label="整理结果", lines=5, interactive=False)
 
             with gr.Tab("3 · 训练 LoRA"):
                 gr.Markdown(
@@ -2027,7 +2341,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         auto_start.click(
             start_h3_generation,
             [
-                auto_people, auto_outfits, auto_poses, auto_portrait_keyword,
+                auto_people, auto_outfits, auto_poses, auto_person_mode, auto_portrait_keyword,
                 auto_pose_keyword, auto_costume_keyword, auto_pose_count,
                 auto_pose_safe, auto_job_name, auto_instruction,
                 auto_size, auto_width, auto_height, auto_seed,
@@ -2044,7 +2358,41 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         auto_log_timer = gr.Timer(value=2.0, active=True)
         auto_log_timer.tick(read_log, outputs=auto_log)
         auto_log_refresh.click(read_log, outputs=auto_log)
-        auto_refresh.click(refresh_generated_targets, auto_job_dir, auto_gallery)
+        auto_refresh.click(
+            refresh_generated_targets,
+            [auto_job_dir, auto_exclusions],
+            [auto_gallery, auto_selected_target, auto_review_status],
+        )
+        auto_apply_exclusions.click(
+            apply_review_exclusions,
+            [auto_job_dir, auto_exclusions],
+            [auto_gallery, auto_selected_target, auto_review_status],
+        )
+        auto_exclusions.submit(
+            apply_review_exclusions,
+            [auto_job_dir, auto_exclusions],
+            [auto_gallery, auto_selected_target, auto_review_status],
+        )
+        auto_clear_exclusions.click(
+            clear_review_exclusions,
+            auto_job_dir,
+            [auto_gallery, auto_exclusions, auto_selected_target, auto_review_status],
+        )
+        auto_gallery.select(
+            select_review_target,
+            [auto_job_dir, auto_exclusions],
+            [auto_selected_target, auto_review_status],
+        )
+        auto_exclude_selected.click(
+            exclude_selected_target,
+            [auto_job_dir, auto_exclusions, auto_selected_target],
+            [auto_gallery, auto_exclusions, auto_selected_target, auto_review_status],
+        )
+        auto_restore_selected.click(
+            restore_selected_target,
+            [auto_job_dir, auto_exclusions, auto_selected_target],
+            [auto_gallery, auto_exclusions, auto_selected_target, auto_review_status],
+        )
         auto_finalize.click(
             finalize_generated_dataset,
             [auto_job_dir, auto_trigger, auto_exclusions, auto_refined],
@@ -2084,7 +2432,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         artifact_load_review.click(
             use_artifact_for_review,
             artifact_jobs,
-            [auto_job_dir, auto_gallery, artifact_status],
+            [auto_job_dir, auto_gallery, auto_exclusions, auto_selected_target, auto_review_status, artifact_status],
         )
         artifact_load_train.click(
             use_artifact_as_dataset,
