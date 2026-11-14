@@ -102,9 +102,19 @@ INSTALL_LOG = LOGS / "install-backends.log"
 INSTALL_STATE = {"running": False, "step": "尚未开始", "returncode": None, "lock": threading.Lock()}
 
 CUSTOM_GENERATION_SIZE = "自定义尺寸（高级）"
-PERSON_MODE_BALANCED = "多人均分随机（推荐）"
+PERSON_MODE_BATCH = "每批固定一人（推荐）"
+PERSON_MODE_PER_ITEM = "每条独立随机"
+PERSON_MODE_BALANCED = "多人均分随机"
 PERSON_MODE_MULTI_REF = "同一人物多图参考"
-PERSON_MODES = (PERSON_MODE_BALANCED, PERSON_MODE_MULTI_REF)
+PERSON_MODES = (
+    PERSON_MODE_BATCH,
+    PERSON_MODE_PER_ITEM,
+    PERSON_MODE_BALANCED,
+    PERSON_MODE_MULTI_REF,
+)
+OUTFIT_MODE_MULTI_REF = "多图作为同一套服装"
+OUTFIT_MODE_RANDOM = "每张作为独立服装随机"
+OUTFIT_MODES = (OUTFIT_MODE_MULTI_REF, OUTFIT_MODE_RANDOM)
 COMMON_GENERATION_SIZES = (
     (512, 512, "1:1"),
     (512, 768, "2:3"),
@@ -885,7 +895,7 @@ def prepare_h3_character_dataset(
     return str(root), summary
 
 
-def balanced_people_assignments(people: list[Path], count: int, seed: int) -> list[Path]:
+def balanced_people_assignments(people: list, count: int, seed: int) -> list:
     if not people or count <= 0:
         return []
     rng = random.Random(int(seed))
@@ -895,6 +905,17 @@ def balanced_people_assignments(people: list[Path], count: int, seed: int) -> li
         assignments.extend(rng.sample(people, remainder))
     rng.shuffle(assignments)
     return assignments
+
+
+def random_sample(items: list, count: int, rng: random.Random) -> list:
+    if not items or count <= 0:
+        return []
+    pool = list(items)
+    selected = []
+    while len(selected) < count:
+        rng.shuffle(pool)
+        selected.extend(pool[: count - len(selected)])
+    return selected
 
 
 def parse_keywords(raw: str) -> list[str]:
@@ -1016,9 +1037,13 @@ def build_h3_generation_prompt(
 
 
 def prepare_h3_generation_job(
-    people, outfits, poses, person_mode, portrait_keyword, keyword, costume_keyword,
+    people, outfits, poses, person_mode, outfit_mode,
+    portrait_keyword, keyword, costume_keyword,
     max_items, safe_only, job_name, instruction, prompt_mode, prompt_template, seed,
 ):
+    count = max(1, int(max_items))
+    seed = int(seed)
+    rng = random.Random(seed)
     people_files = _upload_paths(people)
     outfit_files = _upload_paths(outfits)
     pose_files = _upload_paths(poses)
@@ -1031,37 +1056,50 @@ def prepare_h3_generation_job(
             gallery_cache = pose_gallery_root(require_data=True)
         return gallery_cache
 
-    portrait_item = None
-    if not people_files:
+    person_candidates = []
+    if people_files:
+        for index, path in enumerate(people_files, 1):
+            person_candidates.append({
+                "id": f"uploaded-person-{index}",
+                "title": path.stem or f"person {index}",
+                "path": path,
+                "gallery_item": None,
+                "body_proportions": None,
+            })
+    else:
         portrait_index = gallery() / "data/portrait-zh.json"
         if not portrait_index.is_file():
             raise gr.Error("Pose 仓库缺少 data/portrait-zh.json，请重新同步完整图库")
         portrait_keywords = parse_keywords(portrait_keyword)
-        portraits = []
         for item in json.loads(portrait_index.read_text(encoding="utf-8")):
             searchable = " ".join(str(item.get(k, "")) for k in ("id", "分区", "发长", "发型名称", "标题", "检索"))
             if not matches_keywords(searchable.lower(), portrait_keywords):
                 continue
             source = gallery() / item.get("原图", "")
             if source.is_file():
-                portraits.append((item, source))
-        if not portraits:
+                person_candidates.append({
+                    "id": str(item.get("id", "")),
+                    "title": str(item.get("标题", "")),
+                    "path": source,
+                    "gallery_item": item,
+                    "body_proportions": portrait_has_body_proportions(item),
+                })
+        if not person_candidates:
             raise gr.Error("人像库中没有符合条件且已下载的人物；可清空关键词或重新同步图库")
-        portrait_item, portrait_path = random.SystemRandom().choice(portraits)
-        people_files = [portrait_path]
+
     if pose_files:
-        selected = [
+        pose_pool = [
             ({
                 "id": f"uploaded-pose-{index}", "体系": "uploaded", "分类": "custom",
                 "姿势名称": f"Uploaded pose {index}", "角度": "reference",
             }, path)
-            for index, path in enumerate(pose_files[:int(max_items)], 1)
+            for index, path in enumerate(pose_files, 1)
         ]
     else:
         index = gallery() / "data/pose-zh.json"
         if not index.is_file():
             raise gr.Error("请先在“姿势图库”页同步 Pose 仓库，或上传自定义 Pose 参考图")
-        selected = []
+        pose_pool = []
         for item in json.loads(index.read_text(encoding="utf-8")):
             searchable = " ".join(str(item.get(k, "")) for k in ("体系", "分类", "姿势名称", "角度", "检索"))
             if not matches_keywords(searchable.lower(), pose_keywords):
@@ -1070,17 +1108,31 @@ def prepare_h3_generation_job(
                 continue
             pose = gallery() / item.get("原图", "")
             if pose.is_file():
-                selected.append((item, pose))
-            if len(selected) >= int(max_items):
-                break
-    if not selected:
+                pose_pool.append((item, pose))
+    if not pose_pool:
         raise gr.Error("没有可用的 Pose 参考图；请调整筛选条件或上传自定义 Pose")
-    costumes = []
-    if not outfit_files:
+    selected = random_sample(pose_pool, count, rng)
+
+    if outfit_files:
+        if outfit_mode == OUTFIT_MODE_RANDOM:
+            costume_pool = [
+                ({
+                    "id": f"uploaded-outfit-{index}",
+                    "服装名称": f"the uploaded outfit {index}",
+                    "关键词": "",
+                }, [path])
+                for index, path in enumerate(outfit_files, 1)
+            ]
+        else:
+            costume_pool = [({
+                "id": "uploaded-outfit-set", "服装名称": "the uploaded outfit set", "关键词": "",
+            }, list(outfit_files))]
+    else:
         costume_index = gallery() / "data/costume-zh.json"
         if not costume_index.is_file():
             raise gr.Error("Pose 仓库缺少 data/costume-zh.json，请重新同步图库")
         costume_keywords = parse_keywords(costume_keyword)
+        costume_pool = []
         for item in json.loads(costume_index.read_text(encoding="utf-8")):
             searchable = " ".join(str(item.get(k, "")) for k in ("分类", "服装名称", "标签", "关键词", "检索"))
             if not matches_keywords(searchable.lower(), costume_keywords):
@@ -1089,43 +1141,59 @@ def prepare_h3_generation_job(
                 continue
             source = gallery() / item.get("原图", "")
             if source.is_file():
-                costumes.append((item, source))
-        if not costumes:
+                costume_pool.append((item, [source]))
+        if not costume_pool:
             raise gr.Error("服装库中没有符合条件且已下载的服装；可换关键词或重新同步图库")
+    costume_sets = random_sample(costume_pool, len(selected), rng)
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", job_name.strip()).strip("-.") or "h3-auto-targets"
     root = _new_dataset_root(safe_name)
     refs = root / "references"
     refs.mkdir()
-    person_names_by_source = {}
-    person_ids = {}
-    person_titles = {}
-    for index, path in enumerate(people_files, 1):
-        person_names_by_source[path] = f"references/{_copy_named(path, refs, 'person', index)}"
-        person_ids[path] = f"uploaded-person-{index}"
-        person_titles[path] = path.stem or f"person {index}"
-    balanced_people = person_mode != PERSON_MODE_MULTI_REF and len(people_files) > 1
-    if balanced_people:
-        person_assignments = balanced_people_assignments(people_files, len(selected), int(seed))
+
+    if person_mode == PERSON_MODE_MULTI_REF and len(person_candidates) > 1:
+        person_assignments = [list(person_candidates) for _ in selected]
+    elif person_mode == PERSON_MODE_PER_ITEM:
+        person_assignments = [
+            [candidate] for candidate in random_sample(person_candidates, len(selected), rng)
+        ]
+    elif person_mode == PERSON_MODE_BALANCED:
+        person_assignments = [
+            [candidate] for candidate in balanced_people_assignments(person_candidates, len(selected), seed)
+        ]
     else:
-        person_assignments = [list(people_files) for _ in selected]
-    portrait_body_proportions = portrait_has_body_proportions(portrait_item)
-    uploaded_outfit_names = [f"references/{_copy_named(path, refs, 'outfit', i)}" for i, path in enumerate(outfit_files, 1)]
+        fixed_person = rng.choice(person_candidates)
+        person_assignments = [[fixed_person] for _ in selected]
+
+    person_names_by_source = {}
+    for assignment in person_assignments:
+        for candidate in assignment:
+            path = candidate["path"]
+            if path not in person_names_by_source:
+                person_names_by_source[path] = (
+                    f"references/{_copy_named(path, refs, 'person', len(person_names_by_source) + 1)}"
+                )
+    outfit_names_by_source = {}
     manifest = []
     for i, (pose_item, pose_path) in enumerate(selected, 1):
-        assigned_people = [person_assignments[i - 1]] if balanced_people else person_assignments[i - 1]
-        person_names = [person_names_by_source[path] for path in assigned_people]
-        if uploaded_outfit_names:
-            outfit_names = uploaded_outfit_names
-            costume_item = {"id": "uploaded", "服装名称": "the uploaded outfit", "关键词": ""}
-        else:
-            costume_item, costume_path = costumes[(i - 1) % len(costumes)]
-            outfit_names = [f"references/{_copy_named(costume_path, refs, 'costume', i)}"]
+        assigned_people = person_assignments[i - 1]
+        person_names = [person_names_by_source[candidate["path"]] for candidate in assigned_people]
+        costume_item, costume_paths = costume_sets[i - 1]
+        outfit_names = []
+        for costume_path in costume_paths:
+            if costume_path not in outfit_names_by_source:
+                outfit_names_by_source[costume_path] = (
+                    f"references/{_copy_named(costume_path, refs, 'costume', len(outfit_names_by_source) + 1)}"
+                )
+            outfit_names.append(outfit_names_by_source[costume_path])
         pose_name = f"references/{_copy_named(pose_path, refs, 'pose', i)}"
         all_refs = person_names + outfit_names + [pose_name]
         person_range = "<Picture 1>" if len(person_names) == 1 else f"<Picture 1>-<Picture {len(person_names)}>"
         outfit_start = len(person_names) + 1
         outfit_range = f"<Picture {outfit_start}>" if len(outfit_names) == 1 else f"<Picture {outfit_start}>-<Picture {outfit_start + len(outfit_names) - 1}>"
         pose_number = len(all_refs)
+        portrait_body_proportions = (
+            assigned_people[0]["body_proportions"] if len(assigned_people) == 1 else None
+        )
         pose_text = f"{pose_item.get('体系', '')}, {pose_item.get('分类', '')}, {pose_item.get('姿势名称', '')}, camera angle: {pose_item.get('角度', '')}"
         costume_text = f"{costume_item.get('服装名称', '')}; {costume_item.get('关键词', '')}"
         prompt = build_h3_generation_prompt(
@@ -1133,52 +1201,70 @@ def prepare_h3_generation_job(
             portrait_body_proportions, instruction, prompt_mode, prompt_template,
             costume_text, pose_text,
         )
-        if portrait_item:
-            portrait_id = portrait_item.get("id", "")
-            portrait_title = portrait_item.get("标题", "")
-            portrait_mode = "gallery-random"
-        elif balanced_people:
-            selected_person = assigned_people[0]
-            portrait_id = person_ids[selected_person]
-            portrait_title = person_titles[selected_person]
-            portrait_mode = PERSON_MODE_BALANCED
-        else:
-            portrait_id = "uploaded-person-pool"
-            portrait_title = f"uploaded person pool ({len(people_files)} refs)"
+        if len(assigned_people) > 1:
+            portrait_id = "person-pool"
+            portrait_title = f"person pool ({len(assigned_people)} refs)"
             portrait_mode = PERSON_MODE_MULTI_REF
+        else:
+            portrait_id = assigned_people[0]["id"]
+            portrait_title = assigned_people[0]["title"]
+            if not people_files and person_mode == PERSON_MODE_PER_ITEM:
+                portrait_mode = "gallery-random-each"
+            elif not people_files and person_mode == PERSON_MODE_BALANCED:
+                portrait_mode = "gallery-balanced"
+            elif not people_files:
+                portrait_mode = "gallery-random-batch"
+            else:
+                portrait_mode = person_mode
         manifest.append({
             "output": f"target_{i:04d}.png", "pose_id": pose_item.get("id", ""),
             "pose_name": pose_item.get("姿势名称", ""), "costume_id": costume_item.get("id", ""),
             "costume_name": costume_item.get("服装名称", ""),
             "portrait_id": portrait_id, "portrait_title": portrait_title,
             "portrait_mode": portrait_mode, "selection_seed": int(seed),
+            "person_strategy": person_mode, "outfit_mode": outfit_mode,
             "portrait_body_proportions": portrait_body_proportions,
             "prompt_mode": prompt_mode,
             "prompt": prompt, "edit_image": all_refs,
         })
     (root / "generation.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    if portrait_item:
-        person_source = f"仓库随机人物：{portrait_item.get('id', '')} · {portrait_item.get('标题', '')}"
-    elif balanced_people:
-        counts = Counter(person_assignments)
-        distribution = "；".join(
-            f"{person_titles[person]} ×{counts[person]}" for person in people_files if counts[person]
-        )
-        person_source = f"上传人物池 {len(people_files)} 人 · 均分随机 · {distribution}"
+
+    person_counts = Counter(candidate["id"] for assignment in person_assignments for candidate in assignment)
+    person_origin = "上传人物" if people_files else "图库随机"
+    if len(person_counts) == 1:
+        only_person = next(iter(person_counts))
+        person_source = f"{person_origin} · {only_person} · 本批全部使用同一人物"
     else:
-        person_source = f"上传人物 · {len(people_files)} 张同一人物参考"
-    outfit_source = "上传的服装参考" if outfit_files else "仓库服装库"
-    pose_source = "上传的 Pose 参考" if pose_files else "仓库 Pose 库"
-    if portrait_body_proportions is False:
+        distribution = "、".join(f"{person_id}×{amount}" for person_id, amount in person_counts.most_common(6))
+        if len(person_counts) > 6:
+            distribution += "…"
+        person_source = f"{person_origin} · {person_mode} · 本批 {len(person_counts)} 人：{distribution}"
+
+    pose_ids = [str(item.get("id", "")) for item, _ in selected]
+    pose_source = (
+        f"{'上传' if pose_files else '仓库'} Pose · {len(pose_pool)} 个候选 · 随机抽取 {len(selected)} 条"
+        f"（{ '、'.join(pose_ids[:6]) }{'…' if len(pose_ids) > 6 else ''}）"
+    )
+    costume_ids = [str(item.get("id", "")) for item, _ in costume_sets]
+    outfit_source = (
+        f"{'上传' if outfit_files else '仓库'}服装 · {len(costume_pool)} 个候选 · "
+        f"随机抽取 {len(costume_sets)} 套（{ '、'.join(costume_ids[:6]) }{'…' if len(costume_ids) > 6 else ''}）"
+    )
+    proportion_values = {
+        candidate["body_proportions"] for assignment in person_assignments for candidate in assignment
+    }
+    if proportion_values == {False}:
         proportion_source = "人物参考不提供身材比例；使用自然的亚洲女性比例，Pose 仅控制姿势"
-    elif portrait_body_proportions is None:
+    elif proportion_values == {None}:
         proportion_source = "人物参考仅保留身份和可见特征；比例收敛为自然的亚洲女性比例，Pose 仅控制姿势"
-    else:
+    elif len(proportion_values) == 1:
         proportion_source = "以人物参考的可见体型比例为准并收敛为自然的亚洲女性比例；Pose 仅控制姿势"
+    else:
+        proportion_source = "逐条按所分配的人物参考处理比例，并统一收敛为自然的亚洲女性比例；Pose 仅控制姿势"
     return str(root), (
         f"已构造 {len(manifest)} 个生成任务。\n人物：{person_source}\n"
         f"服装：{outfit_source}\nPose：{pose_source}\n身材与比例：{proportion_source}\n"
-        f"提示词：{prompt_mode}\n"
+        f"提示词：{prompt_mode}\n素材 Seed：{seed}\n"
         "提示词由人物、服装与 Pose 字段自动组合；人物分配记录在 generation.json。"
     )
 
@@ -1200,7 +1286,8 @@ def build_h3_generation_command(job_dir, width, height, seed):
 
 
 def start_h3_generation(
-    people, outfits, poses, person_mode, portrait_keyword, pose_keyword, costume_keyword,
+    people, outfits, poses, person_mode, outfit_mode,
+    portrait_keyword, pose_keyword, costume_keyword,
     max_items, safe_only, job_name, instruction, prompt_mode, prompt_template,
     size_choice, width, height, seed,
 ):
@@ -1208,12 +1295,19 @@ def start_h3_generation(
     if gpu_error:
         raise gr.Error(gpu_error)
     width, height = resolve_generation_size(size_choice, width, height)
+    try:
+        resolved_seed = int(seed)
+    except (TypeError, ValueError) as exc:
+        raise gr.Error("Seed 必须是整数；留 -1 表示每批自动随机") from exc
+    if resolved_seed < 0:
+        resolved_seed = random.SystemRandom().randrange(1, 2**31)
     job_dir, summary = prepare_h3_generation_job(
-        people, outfits, poses, person_mode, portrait_keyword, pose_keyword, costume_keyword,
-        max_items, safe_only, job_name, instruction, prompt_mode, prompt_template, seed,
+        people, outfits, poses, person_mode, outfit_mode,
+        portrait_keyword, pose_keyword, costume_keyword,
+        max_items, safe_only, job_name, instruction, prompt_mode, prompt_template, resolved_seed,
     )
-    command = build_h3_generation_command(job_dir, width, height, seed)
-    summary = f"{summary}\n画面尺寸：{width} × {height}"
+    command = build_h3_generation_command(job_dir, width, height, resolved_seed)
+    summary = f"{summary}\n画面尺寸：{width} × {height}\n本次 Seed：{resolved_seed}"
     status = start_training(command, "h3-generate", {"job_dir": job_dir, "summary": summary, "command": command})
     return job_dir, summary, command, status
 
@@ -2164,12 +2258,12 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         with gr.Tabs():
             with gr.Tab("1 · 生成目标图"):
                 gr.Markdown(
-                    "默认从完整图库随机选择一位人物，并自动搭配服装与 Pose；上传多个人物并选择“多人均分随机”时，"
-                    "人物会按任务分配，不再固定为同一人。"
+                    "默认直接从**完整图库随机抽样**，不需要先筛选人物。人物策略决定整批固定同一人，"
+                    "还是每条任务独立换人；Pose 与服装也会从完整候选池随机抽取，不再顺序取图库前几条。"
                 )
                 gr.Markdown(
-                    "人物、Pose 和服装范围均支持多个关键词：用英文逗号、中文逗号、分号、竖线或换行分隔，"
-                    "任一关键词命中即可；留空时按对应图库的默认规则选择。"
+                    "下面的关键词筛选只用于缩小随机范围：留空即全库参与；多个关键词用英文逗号、中文逗号、"
+                    "分号、竖线或换行分隔，任一命中即可。"
                 )
                 gr.Markdown(
                     "内置人像库只提供面部与发型参考，不含可靠肢体比例。提示词会明确要求生成协调的成年女性化身体结构；"
@@ -2177,28 +2271,58 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     "不再把中文元数据拼进正文，并强制禁止字幕、标签、水印和排版文字。"
                 )
                 with gr.Row():
-                    auto_portrait_keyword = gr.Textbox(
-                        label="人物范围（可多个关键词）",
-                        placeholder="短发，长发，正脸参考；留空全库随机",
-                    )
-                    auto_pose_keyword = gr.Textbox(
-                        label="Pose 范围（可多个关键词）",
-                        placeholder="站姿，坐姿，侧面；留空按图库顺序",
-                    )
-                    auto_costume_keyword = gr.Textbox(
-                        label="服装范围（可多个关键词）",
-                        placeholder="春季，礼服；留空按图库顺序",
+                    auto_person_mode = gr.Dropdown(
+                        choices=list(PERSON_MODES),
+                        value=PERSON_MODE_BATCH,
+                        label="人物策略",
+                        info="每批一人最适合人物 LoRA；逐条随机会混入多张不同面孔。上传人物后，所选策略直接作用于上传人物池",
                     )
                     auto_pose_count = gr.Number(
                         value=4, minimum=1, maximum=200, precision=0,
                         label="生成数量",
                     )
-                with gr.Row():
+                    auto_seed = gr.Number(
+                        value=-1, precision=0, label="素材与生成 Seed",
+                        info="-1 = 每批自动换随机种子；填写固定整数可复现同一组人物、Pose 和服装",
+                    )
+                with gr.Accordion("自定义素材（可选，上传即覆盖对应图库）", open=True):
+                    gr.Markdown(
+                        "只需上传想固定或替换的那一类；未上传的类别继续从完整图库随机。"
+                        "多个人物可选逐条随机、均分随机或同一人多图参考；多张 Pose 会组成随机候选池。"
+                    )
+                    with gr.Row():
+                        auto_people = gr.Files(label="自定义人物（可选）", file_types=["image"])
+                        auto_outfits = gr.Files(label="自定义服装（可选）", file_types=["image"])
+                        auto_poses = gr.Files(label="自定义 Pose（可选）", file_types=["image"])
+                    auto_outfit_mode = gr.Dropdown(
+                        choices=list(OUTFIT_MODES),
+                        value=OUTFIT_MODE_MULTI_REF,
+                        label="多张自定义服装的处理方式",
+                        info="多图同一套适合正反面/细节图；独立随机适合把每张上传图当作一套不同的衣服",
+                    )
+                with gr.Accordion("图库筛选（可选：留空表示全库随机）", open=False):
+                    gr.Markdown(
+                        "筛选只缩小随机池，不填任何关键词也能直接生成。自定义 Pose 不受图库 18+ 分类过滤影响。"
+                    )
+                    with gr.Row():
+                        auto_portrait_keyword = gr.Textbox(
+                            label="人物筛选（可多个关键词）",
+                            placeholder="短发，长发，正脸参考；留空 = 全库随机",
+                        )
+                        auto_pose_keyword = gr.Textbox(
+                            label="Pose 筛选（可多个关键词）",
+                            placeholder="站姿，坐姿，侧面；留空 = 全库随机",
+                        )
+                        auto_costume_keyword = gr.Textbox(
+                            label="服装筛选（可多个关键词）",
+                            placeholder="春季，礼服；留空 = 全库随机",
+                        )
                     auto_pose_safe = gr.Checkbox(
                         value=True,
                         label="18+ 安全过滤（推荐开启）",
                         info="排除性感、内衣/泳装、双人缠绵等图库分类",
                     )
+                with gr.Row():
                     auto_size = gr.Dropdown(
                         choices=generation_size_choices,
                         value=generation_size_default,
@@ -2232,27 +2356,11 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     info="启动时使用这里的最终模板；切换上方选项后点击“载入所选模板”可覆盖编辑内容",
                 )
                 gr.Markdown(PROMPT_TEMPLATE_HELP)
-                with gr.Accordion("自定义参考（可选）", open=False):
-                    gr.Markdown(
-                        "上传任意一类或全部素材后，会覆盖对应的图库随机参考；未上传的类型继续从图库选择。"
-                        "自定义 Pose 不受图库 18+ 分类过滤影响，请自行确认素材。"
-                    )
-                    with gr.Row():
-                        auto_people = gr.Files(label="自定义人物（可选）", file_types=["image"])
-                        auto_outfits = gr.Files(label="自定义服装（可选）", file_types=["image"])
-                        auto_poses = gr.Files(label="自定义 Pose（可选）", file_types=["image"])
-                    auto_person_mode = gr.Dropdown(
-                        choices=list(PERSON_MODES),
-                        value=PERSON_MODE_BALANCED,
-                        label="多张自定义人物的分配方式",
-                        info="均分随机会按生成数量尽量平均分配每人，并用 Seed 固定结果；同一人物多图参考会把所有人物图同时送入每张任务",
-                    )
                 with gr.Accordion("自定义尺寸与任务参数（高级）", open=False):
                     gr.Markdown("常用尺寸会自动带入；只有选择“自定义尺寸（高级）”时才使用下面宽高。宽高需为 16 的倍数且不能超过安全预算。")
                     with gr.Row():
                         auto_width = gr.Number(value=768, precision=0, label="自定义宽度")
                         auto_height = gr.Number(value=768, precision=0, label="自定义高度")
-                        auto_seed = gr.Number(value=42, precision=0, label="Seed")
                         auto_job_name = gr.Textbox(value="h3-auto-targets", label="批次名称")
                     auto_command = gr.Textbox(label="自动命令", lines=4)
                 auto_start = gr.Button("生成目标图", variant="primary")
@@ -2408,7 +2516,8 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
         auto_start.click(
             start_h3_generation,
             [
-                auto_people, auto_outfits, auto_poses, auto_person_mode, auto_portrait_keyword,
+                auto_people, auto_outfits, auto_poses, auto_person_mode, auto_outfit_mode,
+                auto_portrait_keyword,
                 auto_pose_keyword, auto_costume_keyword, auto_pose_count,
                 auto_pose_safe, auto_job_name, auto_instruction, auto_prompt_mode, auto_prompt_template,
                 auto_size, auto_width, auto_height, auto_seed,
