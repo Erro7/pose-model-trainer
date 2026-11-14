@@ -2055,6 +2055,7 @@ def download_all_lora_outputs():
 
 
 generation_size_choices, generation_size_default, generation_size_guidance = generation_size_options()
+initial_artifact_choices, initial_artifact_values = _artifact_job_choices()
 
 
 with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo:
@@ -2321,9 +2322,10 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     artifact_refresh = gr.Button("刷新成果库", variant="primary")
                     artifact_download = gr.DownloadButton("批量下载选中批次 ZIP", value=None)
                 artifact_jobs = gr.Dropdown(
-                    choices=[],
-                    value=[],
+                    choices=initial_artifact_choices,
+                    value=initial_artifact_values,
                     multiselect=True,
+                    allow_custom_value=True,
                     label="成果批次（可多选）",
                 )
                 artifact_status = gr.Textbox(label="成果摘要", lines=4, interactive=False)
