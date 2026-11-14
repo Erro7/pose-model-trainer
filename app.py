@@ -913,7 +913,13 @@ BODY_PROPORTION_MARKERS = (
 ASIAN_FEMALE_ANATOMY_GUIDANCE = (
     "a healthy natural adult East Asian female build: balanced head-to-body relationships, "
     "moderate shoulder width, a soft natural waist-to-hip curve, proportionate torso and limbs, "
-    "realistic joint placement, hands and feet, without exaggerated runway-model elongation."
+    "realistic joint placement, hands and feet, fair clear skin, and a slender, gently contoured "
+    "silhouette with a soft natural presence, without exaggerated runway-model elongation."
+)
+FACIAL_IDENTITY_GUIDANCE = (
+    "Preserve the person's facial identity, face shape, eyes, nose, mouth, hairstyle and "
+    "recognizable features; do not redraw, replace or substitute the pose model's face. "
+    "Only subtle makeup and natural photogenic styling are allowed."
 )
 NO_TEXT_GUIDANCE = (
     "The output must be a clean photograph with no text of any kind: no captions, titles, labels, "
@@ -922,9 +928,37 @@ NO_TEXT_GUIDANCE = (
 )
 POSE_ONLY_GUIDANCE = (
     "Use the pose reference only for joint placement, limb positioning and camera angle. "
-    "Do not copy or infer body shape or proportions from the pose reference. "
-    "Do not copy its identity, face, hairstyle, skin tone or clothing."
+    "It may inform only subtle makeup and photogenic facial styling, never facial identity "
+    "or body proportions. Do not copy its body shape, hairstyle, skin tone or clothing."
 )
+PROMPT_MODE_DEFAULT = "默认模板（推荐）"
+PROMPT_MODE_ORIGINAL = "原版 Prompt（兼容旧效果）"
+PROMPT_MODES = (PROMPT_MODE_DEFAULT, PROMPT_MODE_ORIGINAL)
+DEFAULT_PROMPT_TEMPLATE = (
+    "A photorealistic full-body fashion photograph of {subject}. "
+    "{facial_identity_guidance} "
+    "{body_guidance} "
+    "Dress the same person using only the garment design, colors, materials and accessories shown in {outfit_range}. "
+    "Reproduce the exact body pose, limb placement and camera angle shown in {pose_reference}. "
+    "{pose_guidance} "
+    "Natural lighting, realistic skin and fabric, clean background. "
+    "{instruction} {no_text_guidance}"
+)
+ORIGINAL_PROMPT_TEMPLATE = (
+    "Preserve the identity, face, hairstyle and body proportions from {person_range}. "
+    "Dress the same person in the clothing from {outfit_range}. "
+    "Match the body pose, limb placement and camera viewpoint in {pose_reference} exactly. "
+    "Outfit description: {costume_text}. Pose description: {pose_text}. {instruction}"
+)
+PROMPT_TEMPLATE_HELP = (
+    "可用占位符：`{subject}`、`{person_range}`、`{outfit_range}`、`{pose_reference}`、"
+    "`{facial_identity_guidance}`、`{body_guidance}`、`{pose_guidance}`、`{instruction}`、"
+    "`{no_text_guidance}`、`{costume_text}`、`{pose_text}`。"
+)
+
+
+def prompt_template_for_mode(mode: str) -> str:
+    return ORIGINAL_PROMPT_TEMPLATE if mode == PROMPT_MODE_ORIGINAL else DEFAULT_PROMPT_TEMPLATE
 
 
 def portrait_has_body_proportions(item: dict | None) -> bool | None:
@@ -937,43 +971,53 @@ def portrait_has_body_proportions(item: dict | None) -> bool | None:
 def build_h3_generation_prompt(
     person_range: str, outfit_range: str, pose_number: int,
     body_proportions: bool | None, instruction: str,
+    prompt_mode: str = PROMPT_MODE_DEFAULT, prompt_template: str = "",
+    costume_text: str = "", pose_text: str = "",
 ) -> str:
     if body_proportions is False:
         body_guidance = (
-            "Preserve the identity, face and hairstyle from the person reference. "
             "Do not infer body proportions from the person reference or the pose reference. "
             f"Construct the body as {ASIAN_FEMALE_ANATOMY_GUIDANCE}"
         )
     elif body_proportions is True:
         body_guidance = (
-            f"Preserve the identity, face, hairstyle and recognizable body type from {person_range}. "
+            f"Preserve the recognizable body type from {person_range}. "
             "Keep clearly visible body proportions consistent with that person, but harmonize them into "
             f"{ASIAN_FEMALE_ANATOMY_GUIDANCE} "
             "Body proportions must remain independent of the pose reference."
         )
     else:
         body_guidance = (
-            f"Preserve the identity, face, hairstyle and any recognizable body type from {person_range}. "
+            f"Preserve any recognizable body type from {person_range}. "
             "Preserve any clearly visible body cues from that person, but harmonize them into "
             f"{ASIAN_FEMALE_ANATOMY_GUIDANCE} "
             "If the body is not visible, construct it directly; body proportions must remain independent of the pose reference."
         )
-    parts = [
-        ("A photorealistic full-body fashion photograph of an adult East Asian woman." if body_proportions is False else "A photorealistic full-body fashion photograph."),
-        body_guidance,
-        f"Dress the same person using only the garment design, colors, materials and accessories shown in {outfit_range}.",
-        f"Reproduce the exact body pose, limb placement and camera angle shown in <Picture {pose_number}>. {POSE_ONLY_GUIDANCE}",
-        "Natural lighting, realistic skin and fabric, clean background.",
-    ]
-    if (instruction or "").strip():
-        parts.append(instruction.strip())
-    parts.append(NO_TEXT_GUIDANCE)
-    return " ".join(parts)
+    template = (prompt_template or "").strip() or prompt_template_for_mode(prompt_mode)
+    substitutions = {
+        "subject": "an adult East Asian woman" if body_proportions is False else "an adult woman",
+        "person_range": person_range,
+        "outfit_range": outfit_range,
+        "pose_reference": f"<Picture {pose_number}>",
+        "facial_identity_guidance": FACIAL_IDENTITY_GUIDANCE,
+        "body_guidance": body_guidance,
+        "pose_guidance": POSE_ONLY_GUIDANCE,
+        "instruction": (instruction or "").strip(),
+        "no_text_guidance": NO_TEXT_GUIDANCE,
+        "costume_text": costume_text,
+        "pose_text": pose_text,
+    }
+    try:
+        return " ".join(template.format_map(substitutions).split())
+    except KeyError as exc:
+        raise gr.Error(f"提示词模板包含未知占位符：{exc}") from exc
+    except ValueError as exc:
+        raise gr.Error(f"提示词模板格式错误：{exc}") from exc
 
 
 def prepare_h3_generation_job(
     people, outfits, poses, person_mode, portrait_keyword, keyword, costume_keyword,
-    max_items, safe_only, job_name, instruction, seed,
+    max_items, safe_only, job_name, instruction, prompt_mode, prompt_template, seed,
 ):
     people_files = _upload_paths(people)
     outfit_files = _upload_paths(outfits)
@@ -1082,9 +1126,12 @@ def prepare_h3_generation_job(
         outfit_start = len(person_names) + 1
         outfit_range = f"<Picture {outfit_start}>" if len(outfit_names) == 1 else f"<Picture {outfit_start}>-<Picture {outfit_start + len(outfit_names) - 1}>"
         pose_number = len(all_refs)
+        pose_text = f"{pose_item.get('体系', '')}, {pose_item.get('分类', '')}, {pose_item.get('姿势名称', '')}, camera angle: {pose_item.get('角度', '')}"
+        costume_text = f"{costume_item.get('服装名称', '')}; {costume_item.get('关键词', '')}"
         prompt = build_h3_generation_prompt(
             person_range, outfit_range, pose_number,
-            portrait_body_proportions, instruction,
+            portrait_body_proportions, instruction, prompt_mode, prompt_template,
+            costume_text, pose_text,
         )
         if portrait_item:
             portrait_id = portrait_item.get("id", "")
@@ -1106,6 +1153,7 @@ def prepare_h3_generation_job(
             "portrait_id": portrait_id, "portrait_title": portrait_title,
             "portrait_mode": portrait_mode, "selection_seed": int(seed),
             "portrait_body_proportions": portrait_body_proportions,
+            "prompt_mode": prompt_mode,
             "prompt": prompt, "edit_image": all_refs,
         })
     (root / "generation.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1130,6 +1178,7 @@ def prepare_h3_generation_job(
     return str(root), (
         f"已构造 {len(manifest)} 个生成任务。\n人物：{person_source}\n"
         f"服装：{outfit_source}\nPose：{pose_source}\n身材与比例：{proportion_source}\n"
+        f"提示词：{prompt_mode}\n"
         "提示词由人物、服装与 Pose 字段自动组合；人物分配记录在 generation.json。"
     )
 
@@ -1152,7 +1201,8 @@ def build_h3_generation_command(job_dir, width, height, seed):
 
 def start_h3_generation(
     people, outfits, poses, person_mode, portrait_keyword, pose_keyword, costume_keyword,
-    max_items, safe_only, job_name, instruction, size_choice, width, height, seed,
+    max_items, safe_only, job_name, instruction, prompt_mode, prompt_template,
+    size_choice, width, height, seed,
 ):
     gpu_error = h3_gpu_support_error()
     if gpu_error:
@@ -1160,7 +1210,7 @@ def start_h3_generation(
     width, height = resolve_generation_size(size_choice, width, height)
     job_dir, summary = prepare_h3_generation_job(
         people, outfits, poses, person_mode, portrait_keyword, pose_keyword, costume_keyword,
-        max_items, safe_only, job_name, instruction, seed,
+        max_items, safe_only, job_name, instruction, prompt_mode, prompt_template, seed,
     )
     command = build_h3_generation_command(job_dir, width, height, seed)
     summary = f"{summary}\n画面尺寸：{width} × {height}"
@@ -2167,6 +2217,21 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     label="附加画面要求",
                     lines=2,
                 )
+                with gr.Row():
+                    auto_prompt_mode = gr.Dropdown(
+                        choices=list(PROMPT_MODES),
+                        value=PROMPT_MODE_DEFAULT,
+                        label="提示词模板",
+                        info="默认模板保留当前身份与身材约束；原版 Prompt 兼容旧效果，可能重新出现文字或妆造偏差",
+                    )
+                    auto_prompt_reset = gr.Button("载入所选模板")
+                auto_prompt_template = gr.Textbox(
+                    value=DEFAULT_PROMPT_TEMPLATE,
+                    label="提示词模板（可编辑）",
+                    lines=9,
+                    info="启动时使用这里的最终模板；切换上方选项后点击“载入所选模板”可覆盖编辑内容",
+                )
+                gr.Markdown(PROMPT_TEMPLATE_HELP)
                 with gr.Accordion("自定义参考（可选）", open=False):
                     gr.Markdown(
                         "上传任意一类或全部素材后，会覆盖对应的图库随机参考；未上传的类型继续从图库选择。"
@@ -2345,11 +2410,13 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
             [
                 auto_people, auto_outfits, auto_poses, auto_person_mode, auto_portrait_keyword,
                 auto_pose_keyword, auto_costume_keyword, auto_pose_count,
-                auto_pose_safe, auto_job_name, auto_instruction,
+                auto_pose_safe, auto_job_name, auto_instruction, auto_prompt_mode, auto_prompt_template,
                 auto_size, auto_width, auto_height, auto_seed,
             ],
             [auto_job_dir, auto_summary, auto_command, auto_status],
         )
+        auto_prompt_mode.change(prompt_template_for_mode, auto_prompt_mode, auto_prompt_template)
+        auto_prompt_reset.click(prompt_template_for_mode, auto_prompt_mode, auto_prompt_template)
         auto_size_refresh.click(
             refresh_generation_size_ui,
             auto_size,
