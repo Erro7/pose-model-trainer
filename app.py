@@ -765,9 +765,9 @@ def health_check() -> str:
     elif not candidates:
         next_step = "H3 工作流 → 1 · 生成目标图。"
     elif not finalized:
-        next_step = "H3 工作流 → 2 · 筛选整理。"
+        next_step = "H3 工作流 → 2 · 审核与训练。"
     elif not loras:
-        next_step = "H3 工作流 → 3 · 训练 LoRA。"
+        next_step = "H3 工作流 → 3 · 训练与日志。"
     else:
         next_step = "环境和完整流程均已就绪，可继续生成或训练新批次。"
     overall = "阻塞" if blocked else "可用"
@@ -1491,6 +1491,47 @@ def finalize_generated_dataset(job_dir, trigger_word, exclusions, refined_target
     return str(job), message
 
 
+def suggest_h3_output_name(job_dir) -> str:
+    if not job_dir:
+        return "h3-character-lora"
+    name = Path(job_dir).name
+    name = re.sub(r"-\d{8}-\d{6}-[0-9a-f]{8}$", "", name)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")
+    return f"{name or 'h3-character'}-lora"
+
+
+def finalize_and_start_h3_training(
+    job_dir, trigger_word, exclusions, refined_targets,
+    output_name, model_profile, repeats, epochs, rank, lr, max_pixels, adapter_path, low_vram,
+):
+    task = current_task_snapshot()
+    if task and _task_active(task):
+        raise gr.Error("仍有后台任务运行；请等待当前生成或训练结束后再一键训练")
+    dataset_dir, review_summary = finalize_generated_dataset(
+        job_dir, trigger_word, exclusions, refined_targets,
+    )
+    try:
+        command, output_dir, status = start_h3_lora(
+            dataset_dir, output_name, model_profile, repeats, epochs,
+            rank, lr, max_pixels, adapter_path, low_vram,
+        )
+    except gr.Error as exc:
+        return (
+            dataset_dir,
+            f"{review_summary}\n训练未启动：{exc}",
+            gr.update(),
+            gr.update(),
+            f"训练未启动：{exc}",
+        )
+    return (
+        dataset_dir,
+        f"{review_summary}\n已使用默认训练参数启动 LoRA 训练。",
+        command,
+        output_dir,
+        status,
+    )
+
+
 def build_h3_character_command(dataset_dir, output_name, model_profile, repeats, epochs, rank, lr, max_pixels, adapter_path, low_vram):
     dataset = Path(dataset_dir).expanduser().resolve()
     metadata = dataset / "metadata.json"
@@ -2110,7 +2151,7 @@ def use_artifact_for_review(job_dirs):
     extra = f"；另有 {len(jobs) - 1} 个批次未载入" if len(jobs) > 1 else ""
     return (
         str(job), gallery, "", None, review_status,
-        f"已把 {job.name} 载入“2 · 筛选整理”{extra}。",
+        f"已把 {job.name} 载入“2 · 审核与训练”{extra}。",
     )
 
 
@@ -2252,40 +2293,41 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
     with gr.Tab("H3 工作流"):
         gr.Markdown(
             "## MiniMax H3 人物 LoRA\n"
-            "按 **1 生成目标图 → 2 筛选整理 → 3 训练 LoRA** 操作。"
-            "模型按需自动下载，无需单独填写模型名称。量化权重接近 80GB，完整流程建议预留 100–110GB。"
+            "常规只需两步：**1 生成目标图 → 2 检查图片并一键创建训练集、开始训练**。"
+            "第 3 页仅用于单独重跑训练和查看日志；手动数据与成果库是旁路入口。"
+            "模型按需自动下载，量化权重接近 80GB，完整流程建议预留 100–110GB。"
         )
         with gr.Tabs():
             with gr.Tab("1 · 生成目标图"):
                 gr.Markdown(
-                    "默认直接从**完整图库随机抽样**，不需要先筛选人物。人物策略决定整批固定同一人，"
-                    "还是每条任务独立换人；Pose 与服装也会从完整候选池随机抽取，不再顺序取图库前几条。"
-                )
-                gr.Markdown(
-                    "下面的关键词筛选只用于缩小随机范围：留空即全库参与；多个关键词用英文逗号、中文逗号、"
-                    "分号、竖线或换行分隔，任一命中即可。"
-                )
-                gr.Markdown(
-                    "内置人像库只提供面部与发型参考，不含可靠肢体比例。提示词会明确要求生成协调的成年女性化身体结构；"
-                    "上传带全身比例的人物素材时会优先保留其中明确可见的比例。服装与 Pose 只通过参考图传递，"
-                    "不再把中文元数据拼进正文，并强制禁止字幕、标签、水印和排版文字。"
+                    "选好人物策略、数量和尺寸即可开始，默认全部从完整图库随机，无需先筛选。"
+                    "需要固定素材、关键词或自定义提示词时，再展开下方可选设置。"
                 )
                 with gr.Row():
                     auto_person_mode = gr.Dropdown(
                         choices=list(PERSON_MODES),
                         value=PERSON_MODE_BATCH,
                         label="人物策略",
-                        info="每批一人最适合人物 LoRA；逐条随机会混入多张不同面孔。上传人物后，所选策略直接作用于上传人物池",
+                        info="人物 LoRA 推荐每批固定一人；逐条随机适合需要多人物混合的批次",
                     )
                     auto_pose_count = gr.Number(
                         value=4, minimum=1, maximum=200, precision=0,
                         label="生成数量",
                     )
-                    auto_seed = gr.Number(
-                        value=-1, precision=0, label="素材与生成 Seed",
-                        info="-1 = 每批自动换随机种子；填写固定整数可复现同一组人物、Pose 和服装",
+                    auto_size = gr.Dropdown(
+                        choices=generation_size_choices,
+                        value=generation_size_default,
+                        label="画面尺寸",
+                        info="仅列出当前显存与内存可安全支持的常用尺寸",
                     )
-                with gr.Accordion("自定义素材（可选，上传即覆盖对应图库）", open=True):
+                    auto_size_refresh = gr.Button("重新检测")
+                auto_size_info = gr.Textbox(
+                    value=generation_size_guidance,
+                    show_label=False,
+                    lines=2,
+                    interactive=False,
+                )
+                with gr.Accordion("可选：自定义人物 / 服装 / Pose", open=False):
                     gr.Markdown(
                         "只需上传想固定或替换的那一类；未上传的类别继续从完整图库随机。"
                         "多个人物可选逐条随机、均分随机或同一人多图参考；多张 Pose 会组成随机候选池。"
@@ -2300,9 +2342,15 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                         label="多张自定义服装的处理方式",
                         info="多图同一套适合正反面/细节图；独立随机适合把每张上传图当作一套不同的衣服",
                     )
-                with gr.Accordion("图库筛选（可选：留空表示全库随机）", open=False):
+                with gr.Accordion("高级设置（通常保持默认）", open=False):
+                    with gr.Row():
+                        auto_seed = gr.Number(
+                            value=-1, precision=0, label="素材与生成 Seed",
+                            info="-1 = 每批自动随机；固定整数可复现同一组素材",
+                        )
+                        auto_job_name = gr.Textbox(value="h3-auto-targets", label="批次名称")
                     gr.Markdown(
-                        "筛选只缩小随机池，不填任何关键词也能直接生成。自定义 Pose 不受图库 18+ 分类过滤影响。"
+                        "**图库筛选：** 只缩小随机范围，留空表示全库。多个关键词用逗号、分号、竖线或换行分隔。"
                     )
                     with gr.Row():
                         auto_portrait_keyword = gr.Textbox(
@@ -2322,46 +2370,30 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                         label="18+ 安全过滤（推荐开启）",
                         info="排除性感、内衣/泳装、双人缠绵等图库分类",
                     )
-                with gr.Row():
-                    auto_size = gr.Dropdown(
-                        choices=generation_size_choices,
-                        value=generation_size_default,
-                        label="常用画面尺寸",
-                        info="仅显示当前显存与系统内存可安全支持的尺寸",
+                    auto_instruction = gr.Textbox(
+                        value="Create a high-quality realistic full-body fashion photograph with coherent anatomy, natural lighting and a clean background.",
+                        label="附加画面要求",
+                        lines=2,
                     )
-                    auto_size_refresh = gr.Button("重新检测尺寸")
-                auto_size_info = gr.Textbox(
-                    value=generation_size_guidance,
-                    label="尺寸建议",
-                    lines=5,
-                    interactive=False,
-                )
-                auto_instruction = gr.Textbox(
-                    value="Create a high-quality realistic full-body fashion photograph with coherent anatomy, natural lighting and a clean background.",
-                    label="附加画面要求",
-                    lines=2,
-                )
-                with gr.Row():
-                    auto_prompt_mode = gr.Dropdown(
-                        choices=list(PROMPT_MODES),
-                        value=PROMPT_MODE_DEFAULT,
-                        label="提示词模板",
-                        info="默认模板保留当前身份与身材约束；原版 Prompt 兼容旧效果，可能重新出现文字或妆造偏差",
+                    with gr.Row():
+                        auto_prompt_mode = gr.Dropdown(
+                            choices=list(PROMPT_MODES),
+                            value=PROMPT_MODE_DEFAULT,
+                            label="提示词模板",
+                            info="默认模板保留身份、亚洲女性身材与无文字约束",
+                        )
+                        auto_prompt_reset = gr.Button("载入所选模板")
+                    auto_prompt_template = gr.Textbox(
+                        value=DEFAULT_PROMPT_TEMPLATE,
+                        label="提示词模板（可编辑）",
+                        lines=7,
+                        info="启动时使用这里的最终模板",
                     )
-                    auto_prompt_reset = gr.Button("载入所选模板")
-                auto_prompt_template = gr.Textbox(
-                    value=DEFAULT_PROMPT_TEMPLATE,
-                    label="提示词模板（可编辑）",
-                    lines=9,
-                    info="启动时使用这里的最终模板；切换上方选项后点击“载入所选模板”可覆盖编辑内容",
-                )
-                gr.Markdown(PROMPT_TEMPLATE_HELP)
-                with gr.Accordion("自定义尺寸与任务参数（高级）", open=False):
+                    gr.Markdown(PROMPT_TEMPLATE_HELP)
                     gr.Markdown("常用尺寸会自动带入；只有选择“自定义尺寸（高级）”时才使用下面宽高。宽高需为 16 的倍数且不能超过安全预算。")
                     with gr.Row():
                         auto_width = gr.Number(value=768, precision=0, label="自定义宽度")
                         auto_height = gr.Number(value=768, precision=0, label="自定义高度")
-                        auto_job_name = gr.Textbox(value="h3-auto-targets", label="批次名称")
                     auto_command = gr.Textbox(label="自动命令", lines=4)
                 auto_start = gr.Button("生成目标图", variant="primary")
                 with gr.Row():
@@ -2380,10 +2412,11 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                 )
                 auto_log_file = gr.DownloadButton("下载完整日志", value=str(LATEST_LOG))
 
-            with gr.Tab("2 · 筛选整理"):
+            with gr.Tab("2 · 审核与训练"):
                 gr.Markdown(
                     "预览标题以 `#0001` 格式显示原任务序号。点选图片后可直接排除或恢复；"
-                    "也可以手填序号或范围。上传精修图时仍按顺序替换前 N 张。"
+                    "确认图片没问题后，直接点“创建训练集并开始训练”即可进入下一步。"
+                    "只有需要精修或手动控制参数时，才使用下方的排除序号、替换图和单独训练入口。"
                 )
                 with gr.Row():
                     auto_refresh = gr.Button("刷新候选图", variant="primary")
@@ -2409,23 +2442,27 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                         file_types=["image"],
                     )
                 with gr.Row():
-                    auto_trigger = gr.Textbox(value="ohwx person", label="人物触发词")
-                    auto_finalize = gr.Button("确认并创建训练集", variant="primary")
+                    auto_trigger = gr.Textbox(value="ohwx person", label="人物触发词（默认即可）")
+                    auto_finalize = gr.Button("仅创建训练集")
+                    auto_finalize_train = gr.Button("创建训练集并开始训练", variant="primary")
                 h3_dataset = gr.Textbox(label="训练数据集目录", interactive=False)
                 auto_finalize_summary = gr.Textbox(label="整理结果", lines=5, interactive=False)
 
-            with gr.Tab("3 · 训练 LoRA"):
+            with gr.Tab("3 · 训练与日志"):
                 gr.Markdown(
-                    "使用第 2 步确认的数据集训练。默认采用量化配置、Rank 16、重复 5、Epoch 1 和低显存卸载。"
+                    "通常无需进入本页：第 2 步的“创建训练集并开始训练”会自动使用推荐配置。"
+                    "这里用于单独重跑训练、调整输出名称或查看完整训练日志。"
                 )
+                h3_train_dataset = gr.Textbox(label="当前训练数据集", interactive=False)
                 with gr.Row():
-                    h3_output = gr.Textbox(value="h3-character-lora", label="输出名称")
+                    h3_output = gr.Textbox(value="h3-character-lora", label="训练输出名称")
+                    h3_start = gr.Button("单独启动 LoRA 训练", variant="primary")
+                with gr.Accordion("训练参数与诊断（通常保持默认）", open=False):
                     h3_profile = gr.Dropdown(
                         ["量化版 <80GB（推荐）", "原始 BF16 两阶段（约 130GB）"],
                         value="量化版 <80GB（推荐）",
                         label="模型配置",
                     )
-                with gr.Accordion("训练参数（高级）", open=False):
                     with gr.Row():
                         h3_rank = gr.Number(value=16, precision=0, label="LoRA Rank")
                         h3_lr = gr.Number(value=0.0001, label="学习率")
@@ -2440,7 +2477,6 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                     )
                     h3_command = gr.Textbox(label="自动命令", lines=7)
                     h3_lora_path = gr.Textbox(label="输出目录")
-                h3_start = gr.Button("开始 LoRA 训练", variant="primary")
                 with gr.Row():
                     h3_stop = gr.Button("停止", interactive=False)
                     h3_pause = gr.Button("暂停", interactive=False)
@@ -2504,7 +2540,7 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
                 artifact_status = gr.Textbox(label="成果摘要", lines=4, interactive=False)
                 artifact_gallery = gr.Gallery(label="成果预览", columns=5, height="auto")
                 with gr.Row():
-                    artifact_load_review = gr.Button("载入到筛选整理")
+                    artifact_load_review = gr.Button("载入到审核与训练")
                     artifact_trigger = gr.Textbox(value="ohwx person", label="创建训练集时的人物触发词")
                     artifact_load_train = gr.Button("作为训练集使用", variant="primary")
                 gr.Markdown("### LoRA 训练成品\n`TRAINER_HOME/outputs` 中的 `.safetensors` 会自动收集，可在刷新页面后继续下载。")
@@ -2576,6 +2612,17 @@ with gr.Blocks(title="ModelScope LoRA Trainer", analytics_enabled=False) as demo
             [auto_job_dir, auto_trigger, auto_exclusions, auto_refined],
             [h3_dataset, auto_finalize_summary],
         )
+        auto_finalize_train.click(
+            finalize_and_start_h3_training,
+            [
+                auto_job_dir, auto_trigger, auto_exclusions, auto_refined,
+                h3_output, h3_profile, h3_repeats, h3_epochs,
+                h3_rank, h3_lr, h3_pixels, h3_adapter, h3_low_vram,
+            ],
+            [h3_dataset, auto_finalize_summary, h3_command, h3_lora_path, h3_status],
+        )
+        auto_job_dir.change(suggest_h3_output_name, auto_job_dir, h3_output)
+        h3_dataset.change(lambda value: value, h3_dataset, h3_train_dataset)
 
         h3_start.click(
             start_h3_lora,
